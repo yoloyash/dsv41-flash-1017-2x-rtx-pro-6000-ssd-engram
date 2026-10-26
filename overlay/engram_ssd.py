@@ -13,6 +13,11 @@ diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000 and this vLLM nightly. Dif
 it: int4 rows (128 B nibbles + 16 B fp16 scales, separate tensors) instead of FP8, rows gathered
 with a threaded index_select over an mmap instead of one preadv per row (a 16K-token prefill
 chunk needs ~400K rows per rank), and dequant on the GPU with the stock kernel.
+
+Page cache: MADV_RANDOM is what keeps a 128-byte row from costing a 512 KiB read-around, but
+since Linux 6.3 (vma_has_recency) the kernel also ignores accessed bits on such mappings, so
+Engram pages are never promoted and lose every eviction to the shard pages the loader read
+once. evict_loaded_shards() drops those after load so the Engram rows get the cache.
 """
 from __future__ import annotations
 
@@ -20,6 +25,8 @@ import json
 import mmap
 import os
 import struct
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -82,6 +89,25 @@ class _ShardView:
         arr = np.frombuffer(self._mm, dtype=np.uint8, count=nbytes, offset=offset - page)
         self.table = torch.from_numpy(arr.reshape(self.rows, row_bytes))
         self.offset, self.row_bytes = offset, row_bytes
+        _KEEP.setdefault(os.path.realpath(path), []).append((offset, offset + nbytes))
+
+    def read_range(self, lo: int, hi: int) -> torch.Tensor:
+        """Rows [lo, hi) into anonymous host memory with plain reads, then drop them from the
+        page cache: nothing reads them from the file again."""
+        out = torch.empty(hi - lo, self.row_bytes, dtype=torch.uint8, device="cpu")
+        buf, start = memoryview(out.numpy()).cast("B"), self.offset + lo * self.row_bytes
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            done = 0
+            while done < len(buf):
+                got = os.preadv(fd, [buf[done:done + (1 << 30)]], start + done)
+                if got <= 0:
+                    raise OSError(f"short read from {self.path}")
+                done += got
+            os.posix_fadvise(fd, start, len(buf), os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        return out
 
     def pread_rows(self, rows: list[int]) -> torch.Tensor:
         """Independent reference read (check mode), bypassing the mmap."""
@@ -93,7 +119,49 @@ class _ShardView:
         return out
 
 
+# Byte ranges of the Engram tensors per shard: evict_loaded_shards() leaves them cached.
+_KEEP: dict[str, list[tuple[int, int]]] = {}
+_EVICTED = False
+
+
+def evict_loaded_shards(model_dir: str) -> None:
+    """Once per process, after load: drop every checkpoint byte outside the Engram tensors from
+    the page cache. Loading leaves the last ~35 GB of shards cached and they outlive the Engram
+    pages (see the module docstring). POSIX_FADV_DONTNEED only drops clean, unmapped pages, so
+    it cannot affect correctness. DSV41_ENGRAM_SSD_EVICT=0 disables it."""
+    global _EVICTED
+    if _EVICTED or os.environ.get("DSV41_ENGRAM_SSD_EVICT", "1") != "1":
+        return
+    _EVICTED = True
+    threading.Thread(target=_evict, args=(model_dir,), name="engram-evict", daemon=True).start()
+
+
+def _evict(model_dir: str) -> None:
+    t0, files = time.perf_counter(), 0
+    for root, _, names in os.walk(model_dir):
+        for name in names:
+            if not name.endswith(".safetensors"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                fd = os.open(path, os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                lo, size = 0, os.fstat(fd).st_size
+                for a, b in sorted(_KEEP.get(os.path.realpath(path), [])) + [(size, size)]:
+                    if a > lo:
+                        os.posix_fadvise(fd, lo, a - lo, os.POSIX_FADV_DONTNEED)
+                    lo = max(lo, b)
+                files += 1
+            finally:
+                os.close(fd)
+    logger.info("Engram SSD: dropped the page cache of %d loaded checkpoint files outside the "
+                "Engram tables in %.2f s", files, time.perf_counter() - t0)
+
+
 _POOL: ThreadPoolExecutor | None = None
+_PREFETCH_POOL: ThreadPoolExecutor | None = None
 
 
 def _pool(threads: int) -> ThreadPoolExecutor:
@@ -101,6 +169,14 @@ def _pool(threads: int) -> ThreadPoolExecutor:
     if _POOL is None:
         _POOL = ThreadPoolExecutor(threads, thread_name_prefix="engram-ssd")
     return _POOL
+
+
+def _prefetch_pool(threads: int) -> ThreadPoolExecutor:
+    """Separate from _pool so a step's own reads never queue behind prefetches for later steps."""
+    global _PREFETCH_POOL
+    if _PREFETCH_POOL is None:
+        _PREFETCH_POOL = ThreadPoolExecutor(threads, thread_name_prefix="engram-pf")
+    return _PREFETCH_POOL
 
 
 class SsdEngramTable:
@@ -135,31 +211,80 @@ class SsdEngramTable:
         self.threads = int(os.environ.get("DSV41_ENGRAM_SSD_THREADS", "64"))
         self.min_chunk = int(os.environ.get("DSV41_ENGRAM_SSD_MIN_CHUNK", "32"))
         self.inline_rows = int(os.environ.get("DSV41_ENGRAM_SSD_INLINE_ROWS", "0"))
+        self.pf_threads = int(os.environ.get("DSV41_ENGRAM_SSD_PREFETCH_THREADS", str(self.threads)))
+        self._pf_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
         self.check = engram_ssd_check_enabled()
+        self.model_dir = model_dir
+        # DSV41_ENGRAM_SSD_RESIDENT_SCALES=1: this rank's fp16 scales (1/9 of the table) live in
+        # host RAM, so a cold row costs one SSD read instead of two.
+        self.s_res: torch.Tensor | None = None
+        if os.environ.get("DSV41_ENGRAM_SSD_RESIDENT_SCALES", "0") == "1":
+            t0 = time.perf_counter()
+            self.s_res = self.s.read_range(emb.vocab_start_idx, emb.vocab_end_idx)
+            logger.info("Engram layer %d: %.2f GiB of scales resident in host RAM (%.1f s)",
+                        layer_id, self.s_res.nbytes / 2**30, time.perf_counter() - t0)
         logger.info(
             "Engram layer %d on SSD: rows [%d, %d) of %s, %d local heads, staging %d rows (%.1f MiB pinned)",
             layer_id, emb.vocab_start_idx, emb.vocab_end_idx, os.path.basename(self.w.path),
             self.local_heads, max_rows, (self.w_host.nbytes + self.s_host.nbytes) / 2**20,
         )
 
+    def _scale_ids(self, idx: torch.Tensor) -> torch.Tensor:
+        """Table row ids -> rows of the scale source: the file (global ids) or s_res (local)."""
+        if self.s_res is None:
+            return idx
+        return (idx - self.emb.vocab_start_idx).clamp_(min=0)
+
+    @property
+    def _scale_table(self) -> torch.Tensor:
+        return self.s.table if self.s_res is None else self.s_res
+
     def _submit(self, idx: torch.Tensor, n: int) -> list:
         """Start w_host[:n] / s_host[:n] = the table rows idx (int64 CPU) on the shared pool.
         Cold rows are page faults served one at a time per thread, so cold reads want many
         chunks; warm ones want few, as each chunk costs a pool round trip."""
+        sidx, stab = self._scale_ids(idx), self._scale_table
         if n <= self.inline_rows:
             # Warm rows cost ~100 ns each; a pool round trip costs more than the gather.
             torch.index_select(self.w.table, 0, idx, out=self.w_host[:n])
-            torch.index_select(self.s.table, 0, idx, out=self.s_host[:n])
+            torch.index_select(stab, 0, sidx, out=self.s_host[:n])
             return []
         chunk = max(self.min_chunk, -(-n // self.threads))
 
         def work(lo: int) -> None:
             hi = min(lo + chunk, n)
-            sel = idx[lo:hi]
-            torch.index_select(self.w.table, 0, sel, out=self.w_host[lo:hi])
-            torch.index_select(self.s.table, 0, sel, out=self.s_host[lo:hi])
+            torch.index_select(self.w.table, 0, idx[lo:hi], out=self.w_host[lo:hi])
+            torch.index_select(stab, 0, sidx[lo:hi], out=self.s_host[lo:hi])
 
         return [_pool(self.threads).submit(work, lo) for lo in range(0, n, chunk)]
+
+    def prefetch(self, hashes: torch.Tensor) -> int:
+        """Fault in, without waiting, the rows a later step will read (hashes: [T, n_hash_cols]
+        int32 CPU, prompt tokens past this step), so that step's gather finds them in the page
+        cache. The copies land in a scratch buffer nobody reads. Returns the rows submitted."""
+        emb = self.emb
+        local = hashes[:, emb.head_start: emb.head_start + self.local_heads].reshape(-1)
+        idx = local[(local >= emb.vocab_start_idx) & (local < emb.vocab_end_idx)].to(torch.int64)
+        n = idx.numel()
+        if n == 0:
+            return 0
+        if self._pf_scratch is None or self._pf_scratch[0].shape[0] < n:
+            self._pf_scratch = (torch.empty(n, self.w.row_bytes, dtype=torch.uint8, device="cpu"),
+                                torch.empty(n, self.s.row_bytes, dtype=torch.uint8, device="cpu"))
+        w_out, s_out = self._pf_scratch
+        scales = self.s_res is None
+        chunk = max(self.min_chunk, -(-n // self.pf_threads))
+
+        def work(lo: int) -> None:
+            hi = min(lo + chunk, n)
+            torch.index_select(self.w.table, 0, idx[lo:hi], out=w_out[lo:hi])
+            if scales:
+                torch.index_select(self.s.table, 0, idx[lo:hi], out=s_out[lo:hi])
+
+        pool = _prefetch_pool(self.pf_threads)
+        for lo in range(0, n, chunk):
+            pool.submit(work, lo)
+        return n
 
     def start(self, hashes: torch.Tensor) -> tuple | None:
         """hashes: [T, n_hash_cols] int32 CPU (this layer). Starts the row gather; finish()
@@ -175,6 +300,7 @@ class SsdEngramTable:
         rows = local.reshape(-1)
         owned = (rows >= emb.vocab_start_idx) & (rows < emb.vocab_end_idx)
         idx = torch.where(owned, rows, 0)   # file rows are global ids
+        evict_loaded_shards(self.model_dir)
         # Host staging is reused every step: the previous step's copies must be done reading it.
         self._copied.synchronize()
         return t, n, rows, owned, self._submit(idx, n)

@@ -1,5 +1,5 @@
---- overlay/base/engram.py	2026-10-26 01:35:16.765609643 -0700
-+++ overlay/engram.py	2026-10-26 01:35:06.965534889 -0700
+--- overlay/base/engram.py	2026-10-26 01:11:39.000000000 -0700
++++ overlay/engram.py	2026-10-26 06:09:56.598685605 -0700
 @@ -942,6 +942,13 @@
  # 2026-09-28: DSV41_ENGRAM_INT4=1 serves Engram tables re-encoded by convert_engram_int4.py: packed int4 rows
  # (nibble = q + 8, two per byte) with fp16 per-32 scales. 144 B/row instead of 264 -> ~45% less pinned host RAM.
@@ -45,7 +45,7 @@
          weight, scales = self._storage()
          ids_stride_t, ids_stride_h = indices.stride()
          sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
-@@ -1648,6 +1665,24 @@
+@@ -1648,6 +1665,30 @@
  
          max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
          self._init_staging(max_tokens, layout.head_dim)
@@ -67,6 +67,12 @@
 +    def prestage_finish(self, state) -> None:
 +        assert self.ssd_table is not None
 +        self.ssd_table.finish(state, self.staged_rows)
++
++    def prestage_prefetch(self, hash_ids: torch.Tensor) -> int:
++        """DSV41_ENGRAM_SSD_PREFETCH: start faulting in the rows of prompt tokens a later
++        step will prefill (hash_ids [T, n_hash_cols] on the CPU); returns immediately."""
++        assert self.ssd_table is not None
++        return self.ssd_table.prefetch(hash_ids)
  
      def _create_embedding(
          self, layout: EngramLayout, layer_hash_index: int

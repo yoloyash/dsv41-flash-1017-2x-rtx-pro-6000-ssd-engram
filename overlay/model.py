@@ -134,11 +134,11 @@ class _PrestageStats:
         import os
 
         self.every = int(os.environ.get("DSV41_ENGRAM_SSD_LOG_EVERY", "500"))
-        self.rows: list[tuple[int, float, float]] = []
+        self.rows: list[tuple[int, float, float, int]] = []
         self.checked = 0
 
-    def record(self, tokens: int, hash_s: float, stage_s: float) -> None:
-        self.rows.append((tokens, hash_s, stage_s))
+    def record(self, tokens: int, hash_s: float, stage_s: float, prefetched: int = 0) -> None:
+        self.rows.append((tokens, hash_s, stage_s, prefetched))
         if len(self.rows) < self.every:
             return
         import statistics as st
@@ -149,9 +149,9 @@ class _PrestageStats:
 
         logger.info(
             "engram prestage %d steps, mean tokens %.1f: hash+sync p50 %.2f p99 %.2f ms, "
-            "row gather+stage p50 %.2f p99 %.2f ms, hash checks %d",
+            "row gather+stage p50 %.2f p99 %.2f ms, prefetched tokens %d, hash checks %d",
             len(self.rows), st.mean(r[0] for r in self.rows), ms(1, .5), ms(1, .99),
-            ms(2, .5), ms(2, .99), self.checked,
+            ms(2, .5), ms(2, .99), sum(r[3] for r in self.rows), self.checked,
         )
         self.rows.clear()
 
@@ -951,11 +951,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         query_start_loc: torch.Tensor,
         lookback_token_ids: torch.Tensor,
+        prefetch: tuple[torch.Tensor, ...] | None = None,
     ) -> None:
         """Eager pre-step for DSV41_ENGRAM_SSD=1: hash the (padded) batch, stage
         every engram layer's rows from SSD into its staged_rows, and record the
         token count the next forward must match. Called by
-        DeepseekV41ModelState.prepare_inputs before every step."""
+        DeepseekV41ModelState.prepare_inputs before every step.
+
+        prefetch: (input_ids, positions, query_start_loc, lookback_token_ids) of
+        prompt tokens later steps will prefill. Their rows are hashed the same way
+        and faulted in during this step's forward; nothing waits on them."""
         assert self.engram_hash is not None and self.prestaged_hashes is not None
         num_tokens = input_ids.shape[0]
         if num_tokens > self.prestaged_hashes.shape[0]:
@@ -986,11 +991,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if getattr(layer, "engram", None) is not None
         ]
         states = [e.prestage_start(hashes_cpu[:, e.layer_hash_index]) for e in engrams]
+        p_hashes = None
+        if prefetch is not None:
+            # Hashed while this step's rows are read; submitted only once they are in,
+            # so the prefetch reads overlap the forward, not this step's own reads.
+            p_ids, p_positions, p_query_start_loc, p_lookback = prefetch
+            p_hashes = self.engram_hash(
+                p_ids,
+                p_positions,
+                p_query_start_loc,
+                image_sentinel_mask(p_ids),
+                p_lookback,
+                image_sentinel_mask(p_lookback),
+                self._prestage_dummy_slot_mapping,
+                self._prestage_dummy_block_table,
+            ).cpu()
         for engram, state in zip(engrams, states):
             engram.prestage_finish(state)
         t2 = time.perf_counter()
+        prefetched = 0
+        if p_hashes is not None:
+            for e in engrams:
+                e.prestage_prefetch(p_hashes[:, e.layer_hash_index])
+            prefetched = p_hashes.shape[0]
         self.prestaged_tokens = num_tokens
-        self._prestage_stats.record(num_tokens, t1 - t0, t2 - t1)
+        self._prestage_stats.record(num_tokens, t1 - t0, t2 - t1, prefetched)
 
     def engram_prestage_dummy(self, num_tokens: int) -> None:
         """Capture, profile and warmup runs: fixed shapes, no disk reads."""

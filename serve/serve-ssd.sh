@@ -7,6 +7,11 @@
 #                         also compares the prestaged hashes with the stock in-forward hashes. Run this once first.
 #   ENGRAM_SSD_THREADS=128 ENGRAM_SSD_MIN_CHUNK=8   gather threads / smallest rows per task: a cold row is a page fault that
 #                         blocks its thread for ~100 us, so many small tasks keep the SSD queue deep
+#   ENGRAM_SSD_EVICT=1    after load, drop the page cache of the checkpoint outside the Engram tables, which otherwise
+#                         outlives the Engram rows in the cache (overlay/engram_ssd.py docstring)
+#   ENGRAM_SSD_PREFETCH=16384  tokens: hash the prompt tokens later steps will prefill and fault their rows in during this
+#                         step's forward (one chunk ahead; 0 = off); ENGRAM_SSD_PREFETCH_THREADS (default ENGRAM_SSD_THREADS)
+#   ENGRAM_SSD_RESIDENT_SCALES=1  keep the fp16 scales (11.4 GiB total) in host RAM: one SSD read per cold row, not two
 #   CONTAINER_MEM=120g    (stock: 260g). Page cache is charged to the container, so this also caps how much of the Engram
 #                         tables stays cached; on a 128 GB host 120g leaves ~5 GB for the OS.
 #   PACK=<dir>            required: the downloaded pack (its recipe/ is what runs; build its image and kernels first, README)
@@ -36,6 +41,9 @@ if [[ -n ${SSD_PLAN:-} ]]; then
 fi
 mounts+=(-v "$ROOT/plans:/opt/ssd-plans:ro")
 export DOCKER_EXTRA="${mounts[*]} -e DSV41_ENGRAM_SSD=$ENGRAM_SSD -e DSV41_ENGRAM_SSD_CHECK=${ENGRAM_SSD_CHECK:-0} \
--e DSV41_ENGRAM_SSD_THREADS=${ENGRAM_SSD_THREADS:-128} -e DSV41_ENGRAM_SSD_MIN_CHUNK=${ENGRAM_SSD_MIN_CHUNK:-8} -e DSV41_ENGRAM_SSD_INLINE_ROWS=${ENGRAM_SSD_INLINE_ROWS:-0} -e DSV41_ENGRAM_SSD_LOG_EVERY=${ENGRAM_SSD_LOG_EVERY:-500} ${DOCKER_EXTRA:-}"
+-e DSV41_ENGRAM_SSD_THREADS=${ENGRAM_SSD_THREADS:-128} -e DSV41_ENGRAM_SSD_MIN_CHUNK=${ENGRAM_SSD_MIN_CHUNK:-8} -e DSV41_ENGRAM_SSD_INLINE_ROWS=${ENGRAM_SSD_INLINE_ROWS:-0} -e DSV41_ENGRAM_SSD_LOG_EVERY=${ENGRAM_SSD_LOG_EVERY:-500} \
+-e DSV41_ENGRAM_SSD_EVICT=${ENGRAM_SSD_EVICT:-1} -e DSV41_ENGRAM_SSD_PREFETCH=${ENGRAM_SSD_PREFETCH:-16384} \
+-e DSV41_ENGRAM_SSD_PREFETCH_THREADS=${ENGRAM_SSD_PREFETCH_THREADS:-${ENGRAM_SSD_THREADS:-128}} \
+-e DSV41_ENGRAM_SSD_RESIDENT_SCALES=${ENGRAM_SSD_RESIDENT_SCALES:-1} ${DOCKER_EXTRA:-}"
 echo "[serve-ssd] Engram on SSD: $([[ $ENGRAM_SSD == 1 ]] && echo "on (check ${ENGRAM_SSD_CHECK:-0})" || echo off), container memory $CONTAINER_MEM${SSD_PLAN:+, plan $SSD_PLAN (overrides the plan serve.sh prints below)}"
 exec bash "$RECIPE/serve/serve.sh" "$@"

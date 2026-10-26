@@ -1,3 +1,6 @@
+NOTE (2026-10-26, later): in every bench-fixed line below except bench-fixed-1, the "fresh prefill" figures are prefix-cache
+hits, not prefills: serve/ab.sh ran bench-fixed.py twice with the same prompts and kept the second pass. Only bench-fixed-1
+(first run after boot) measured real prefill. Real prefill numbers are in the "prefill A/B" sections at the end.
 === bench-fixed-1.log
 decode 1 stream: 2K 80.8 | 46K median 114.9 tok/s (74.5 87.1 97.5 103.9 92.2 112.1 132.1 117.7 133.5 135.7) | decode 4 streams 46K median 218.8 agg (218.8 226.5 211.1) | fresh prefill 1673:972 39962:3872 40266:5908 tok/s
 === bench-fixed-2.log
@@ -37,3 +40,75 @@ mean tokens 7.4: hash+sync p50 13.10 p99 25.87 ms, row gather+stage p50 2.11 p99
 === 1M needle (p375 server, recipe/bench/needle-test.py 64500), VRAM sampled every 2 s with nvidia-smi
 prompt_tokens=1,032,034 | 104.0s (~9,920 tok/s prefill) | found=True | 'PELICAN-42'
 peak MiB 95486 95486 of 97887
+=== SSD random-read ceiling (fio 3.36 in ubuntu:24.04, shards 47+48 read-only, 4 KiB randread, 2 jobs, 10 s each)
+direct libaio qd32 x2: IOPS=193k avg lat 286 us | qd128 x2: IOPS=227k avg lat 1129 us | qd512 x2: IOPS=227k avg lat 4516 us
+buffered psync, 128 threads: IOPS=255k-273k
+=== bytes read per random 128 B row fault (3000 random rows of layer 1 read through a fresh mmap, /proc/self/io read_bytes; read_ahead_kb=512 on nvme0n1, kernel 7.0.0-38)
+MADV_RANDOM 3.8 KiB | MADV_NORMAL 445.9-451.8 KiB | FADV_RANDOM on the fd + MADV_NORMAL 433.1 KiB
+=== before the fix: container page cache vs Engram residency (tests/page_cache.py + memory.stat), after ~20 min of benchmarks
+memory.stat: anon 70.7 GiB, file 37.9 GiB (inactive 34.9, active 2.6), workingset_refault_file 20974470
+Engram tensors cached: layer 1 weight 1.9/45.8, scale 1.4/5.7; layer 14 weight 1.9/45.8, scale 1.4/5.7 GiB -> 6.6 of 103.0 GiB
+whole pack: 45.3 GiB cached, of which shards 47+48 (Engram) 8.4 GiB; the rest other shards read once at load
+=== row gather microbenchmark (tests/bench_gather.py, one rank, both layers, 128 threads; beside the running server)
+T=    6 rows/layer=    72: random/cold p50     6.79 ms   warm p50     1.09 ms
+T=   48 rows/layer=   576: random/cold p50    11.94 ms   warm p50     2.97 ms
+T= 2048 rows/layer= 24576: random/cold p50   332.96 ms   warm p50     9.82 ms
+T=16384 rows/layer=196608: random/cold p50  2246.17 ms   warm p50    45.29 ms
+=== parity run 2 (EAGER=1, ENGRAM_SSD_CHECK=1, EVICT=1 PREFETCH=16384 RESIDENT_SCALES=1): 44K + 44K prompt, 3 long prompts prefilling at once (a 4th was empty: driver bug), 16 decode streams, test-image.py
+10-26 11:17:46 [model.py:150] engram prestage 50 steps, mean tokens 47.2: hash+sync p50 82.06 p99 108.61 ms, row gather+stage p50 25.24 p99 27.54 ms, prefetched tokens 0, hash checks 699
+test-image.py: IMAGE OK (4/4); Tracebacks/RuntimeErrors in the log: 0
+=== bit-identity tests (tests/test_engram_ssd.py), RESIDENT_SCALES=0 and 1, layer 1 rank 1 and layer 14 rank 0: all T bit-identical, OK
+=== prefill A/B (bench/prefill_ab.py, corpus bench/make_corpus_py.py, 8 fresh ~40K-token slices per arm, each arm a fresh restart, p375 plan)
+--- round 1
+arm 1 baseline [ENGRAM_SSD_EVICT=0 ENGRAM_SSD_PREFETCH=0 ENGRAM_SSD_RESIDENT_SCALES=0]: ARM 1: A new text median 4132 tok/s (mean 4054) | B Engram warm median 8600 tok/s
+arm 2 evict [ENGRAM_SSD_EVICT=1 ENGRAM_SSD_PREFETCH=0 ENGRAM_SSD_RESIDENT_SCALES=0]: ARM 2: A new text median 5129 tok/s (mean 4846) | B Engram warm median 9635 tok/s
+arm 3 evict+pf16k [ENGRAM_SSD_EVICT=1 ENGRAM_SSD_PREFETCH=16384 ENGRAM_SSD_RESIDENT_SCALES=0]: ARM 3: A new text median 5308 tok/s (mean 4788) | B Engram warm median 9411 tok/s
+--- round 2 (prefetch submitted after the step's own gather)
+arm 4 evict+pf16k [ENGRAM_SSD_EVICT=1 ENGRAM_SSD_PREFETCH=16384 ENGRAM_SSD_RESIDENT_SCALES=0 ENGRAM_SSD_LOG_EVERY=1]: ARM 4: A new text median 5977 tok/s (mean 5710) | B Engram warm median 9373 tok/s
+arm 5 evict+pf32k [ENGRAM_SSD_EVICT=1 ENGRAM_SSD_PREFETCH=32768 ENGRAM_SSD_RESIDENT_SCALES=0 ENGRAM_SSD_LOG_EVERY=1]: ARM 5: A new text median 6017 tok/s (mean 5723) | B Engram warm median 9353 tok/s
+arm 6 evict+scales [ENGRAM_SSD_EVICT=1 ENGRAM_SSD_PREFETCH=0 ENGRAM_SSD_RESIDENT_SCALES=1 ENGRAM_SSD_LOG_EVERY=1]: ARM 6: A new text median 5380 tok/s (mean 5310) | B Engram warm median 9352 tok/s
+arm 7 evict+pf16k+scales [ENGRAM_SSD_EVICT=1 ENGRAM_SSD_PREFETCH=16384 ENGRAM_SSD_RESIDENT_SCALES=1 ENGRAM_SSD_LOG_EVERY=1]: ARM 7: A new text median 6925 tok/s (mean 6867) | B Engram warm median 9394 tok/s
+arm 8 evict-again [ENGRAM_SSD_EVICT=1 ENGRAM_SSD_PREFETCH=0 ENGRAM_SSD_RESIDENT_SCALES=0 ENGRAM_SSD_LOG_EVERY=1]: ARM 8: A new text median 4523 tok/s (mean 4408) | B Engram warm median 9437 tok/s
+arm 9 baseline-again [ENGRAM_SSD_EVICT=0 ENGRAM_SSD_PREFETCH=0 ENGRAM_SSD_RESIDENT_SCALES=0 ENGRAM_SSD_LOG_EVERY=1]: ARM 9: A new text median 4293 tok/s (mean 4318) | B Engram warm median 9020 tok/s
+(round 1 arm 3 ran the first prefetch version, which submitted the prefetch before the step's own gather finished: superseded)
+--- arm 1 per slice
+  slice 8: A 38988 tok 12.54s 3109 tok/s | B 39009 tok 4.21s 9274 tok/s | SSD cost +8.33s
+  slice 9: A 43730 tok 10.33s 4235 tok/s | B 43751 tok 4.57s 9571 tok/s | SSD cost +5.75s
+  slice 10: A 40702 tok 9.89s 4115 tok/s | B 40723 tok 4.19s 9727 tok/s | SSD cost +5.71s
+  slice 11: A 41552 tok 10.04s 4137 tok/s | B 41570 tok 4.90s 8485 tok/s | SSD cost +5.14s
+  slice 12: A 39869 tok 9.22s 4325 tok/s | B 39888 tok 4.94s 8079 tok/s | SSD cost +4.28s
+  slice 13: A 41161 tok 9.31s 4421 tok/s | B 41182 tok 4.85s 8486 tok/s | SSD cost +4.46s
+  slice 14: A 43202 tok 10.90s 3965 tok/s | B 43222 tok 4.96s 8714 tok/s | SSD cost +5.94s
+  slice 15: A 40675 tok 9.85s 4127 tok/s | B 40695 tok 4.83s 8418 tok/s | SSD cost +5.02s
+ARM 1: A new text median 4132 tok/s (mean 4054) | B Engram warm median 8600 tok/s
+--- arm 7 per slice
+  slice 56: A 41467 tok 6.88s 6025 tok/s | B 41490 tok 4.36s 9514 tok/s | SSD cost +2.52s
+  slice 57: A 42109 tok 6.35s 6632 tok/s | B 42130 tok 4.43s 9514 tok/s | SSD cost +1.92s
+  slice 58: A 48740 tok 6.61s 7379 tok/s | B 48764 tok 4.93s 9888 tok/s | SSD cost +1.67s
+  slice 59: A 50848 tok 7.52s 6764 tok/s | B 50869 tok 5.47s 9307 tok/s | SSD cost +2.05s
+  slice 60: A 39790 tok 5.94s 6693 tok/s | B 39810 tok 4.24s 9386 tok/s | SSD cost +1.70s
+  slice 61: A 41223 tok 5.77s 7147 tok/s | B 41242 tok 4.39s 9402 tok/s | SSD cost +1.38s
+  slice 62: A 40453 tok 5.61s 7211 tok/s | B 40473 tok 4.34s 9336 tok/s | SSD cost +1.27s
+  slice 63: A 40437 tok 5.71s 7086 tok/s | B 40462 tok 4.34s 9317 tok/s | SSD cost +1.36s
+ARM 7: A new text median 6925 tok/s (mean 6867) | B Engram warm median 9394 tok/s
+--- arm 9 per slice
+  slice 72: A 40312 tok 12.86s 3135 tok/s | B 40333 tok 4.32s 9335 tok/s | SSD cost +8.54s
+  slice 73: A 57674 tok 11.77s 4899 tok/s | B 57693 tok 5.88s 9816 tok/s | SSD cost +5.89s
+  slice 74: A 41881 tok 9.79s 4276 tok/s | B 41901 tok 4.42s 9481 tok/s | SSD cost +5.37s
+  slice 75: A 45170 tok 9.37s 4819 tok/s | B 45187 tok 4.65s 9713 tok/s | SSD cost +4.72s
+  slice 76: A 45827 tok 9.75s 4701 tok/s | B 45848 tok 5.39s 8503 tok/s | SSD cost +4.36s
+  slice 77: A 38335 tok 8.91s 4301 tok/s | B 38354 tok 4.47s 8580 tok/s | SSD cost +4.44s
+  slice 78: A 37377 tok 8.72s 4285 tok/s | B 37397 tok 4.35s 8598 tok/s | SSD cost +4.37s
+  slice 79: A 39228 tok 9.50s 4128 tok/s | B 39247 tok 4.51s 8705 tok/s | SSD cost +4.99s
+ARM 9: A new text median 4293 tok/s (mean 4318) | B Engram warm median 9020 tok/s
+--- arm 7, rank 0 prestage per prefill step (LOG_EVERY=1), last two prompts: A (new text) then B (same text)
+mean tokens 16380.0: hash+sync p50 0.55 p99 0.55 ms, row gather+stage p50 1150.37 p99 1150.37 ms, prefetched tokens 16384, hash checks 0
+mean tokens 16380.0: hash+sync p50 0.48 p99 0.48 ms, row gather+stage p50 21.32 p99 21.32 ms, prefetched tokens 7673, hash checks 0
+mean tokens 7677.0: hash+sync p50 22.70 p99 22.70 ms, row gather+stage p50 18.73 p99 18.73 ms, prefetched tokens 0, hash checks 0
+mean tokens 16380.0: hash+sync p50 0.54 p99 0.54 ms, row gather+stage p50 30.12 p99 30.12 ms, prefetched tokens 16384, hash checks 0
+mean tokens 16380.0: hash+sync p50 0.50 p99 0.50 ms, row gather+stage p50 21.96 p99 21.96 ms, prefetched tokens 7698, hash checks 0
+mean tokens 7702.0: hash+sync p50 24.34 p99 24.34 ms, row gather+stage p50 17.23 p99 17.23 ms, prefetched tokens 0, hash checks 0
+=== final config on :8000 (defaults: EVICT=1 PREFETCH=16384 RESIDENT_SCALES=1, p375): bench-fixed.py, measured pass (its prefill field dropped)
+decode 1 stream: 2K 150.1 | 46K median 143.5 tok/s (148.1 152.1 133.9 140.2 141.4 145.5 139.1 151.9 160.8 164.2) | decode 4 streams 46K median 249.3 agg (240.6 250.0 249.3)
+=== final config memory after the decode bench
+memory.stat: anon 82.3 GiB, file 12.7 GiB; Engram tensors cached 11.3 of 103.0 GiB (scales: resident, 0.0 cached); host free 24 GB

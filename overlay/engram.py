@@ -1684,6 +1684,12 @@ class Engram(nn.Module):
         assert self.ssd_table is not None
         self.ssd_table.finish(state, self.staged_rows)
 
+    def prestage_prefetch(self, hash_ids: torch.Tensor) -> int:
+        """DSV41_ENGRAM_SSD_PREFETCH: start faulting in the rows of prompt tokens a later
+        step will prefill (hash_ids [T, n_hash_cols] on the CPU); returns immediately."""
+        assert self.ssd_table is not None
+        return self.ssd_table.prefetch(hash_ids)
+
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
     ) -> ParallelEngramEmbedding:

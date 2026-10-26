@@ -1,6 +1,6 @@
---- overlay/base/model_state.py	2026-10-26 01:35:16.766175684 -0700
-+++ overlay/model_state.py	2026-10-26 01:35:07.036536107 -0700
-@@ -400,14 +400,54 @@
+--- overlay/base/model_state.py	2026-10-26 01:11:39.000000000 -0700
++++ overlay/model_state.py	2026-10-26 06:09:56.599126760 -0700
+@@ -400,14 +400,159 @@
              BLOCK_DEPTH=triton.next_power_of_2(depth),
          )
          model_inputs["lookback_token_ids"] = window
@@ -15,9 +15,114 @@
 +                input_batch.positions,
 +                input_batch.query_start_loc[: num_reqs + 1],
 +                window,
++                self._engram_prefetch_inputs(input_batch, req_states, window),
 +            )
++            if (
++                self.__dict__.get("_engram_prefetch_budget", 0) > 0
++                and os.environ.get("DSV41_ENGRAM_SSD_CHECK", "0") == "1"
++            ):
++                self._check_engram_prefetch(inner, input_batch, req_states, window)
          return model_inputs
  
++    def _check_engram_prefetch(self, inner, input_batch, req_states, window) -> None:
++        """DSV41_ENGRAM_SSD_CHECK=1: rebuild this step's prefill chunks with the prefetch
++        builder and raise unless their hashes equal the ones the step just staged."""
++        from vllm.models.deepseek_v41.common.mm_preprocess import image_sentinel_mask
++
++        qsl = input_batch.query_start_loc_np
++        for i in range(input_batch.num_reqs):
++            if not input_batch.is_prefilling_np[i]:
++                continue
++            a = int(input_batch.num_computed_prefill_tokens_np[i])
++            n = int(input_batch.num_scheduled_tokens[i])
++            ids, positions, query_start_loc, lookback = self._engram_hash_inputs(
++                [(int(input_batch.idx_mapping_np[i]), a, a + n)], input_batch, req_states, window
++            )
++            got = inner.engram_hash(
++                ids, positions, query_start_loc, image_sentinel_mask(ids), lookback,
++                image_sentinel_mask(lookback), inner._prestage_dummy_slot_mapping,
++                inner._prestage_dummy_block_table,
++            )
++            ref = inner.prestaged_hashes[int(qsl[i]): int(qsl[i]) + n]
++            if not torch.equal(got, ref):
++                bad = int((got != ref).any(dim=-1).any(dim=-1).sum())
++                raise RuntimeError(
++                    f"engram prefetch builder: {bad} of {n} tokens hash differently from the step"
++                )
++            checked = self.__dict__.get("_engram_prefetch_checked", 0) + 1
++            self._engram_prefetch_checked = checked
++            if checked == 1 or checked % 50 == 0:
++                logger.info("engram prefetch builder check: %d prefill chunks match", checked)
++
++    def _engram_prefetch_inputs(
++        self, input_batch: InputBatch, req_states: RequestState, window: torch.Tensor
++    ) -> tuple[torch.Tensor, ...] | None:
++        """DSV41_ENGRAM_SSD_PREFETCH=<tokens>: the prompt tokens each prefilling request
++        will prefill in the steps after this one, up to that many tokens ahead of it and
++        that many in total, minus what earlier steps already prefetched; as one batch for
++        the n-gram hash (ids, positions, query_start_loc, lookback window). Their Engram
++        rows are faulted in while this step runs. 0 (default) disables it."""
++        budget = self.__dict__.get("_engram_prefetch_budget")
++        if budget is None:
++            budget = int(os.environ.get("DSV41_ENGRAM_SSD_PREFETCH", "0"))
++            self._engram_prefetch_budget = budget
++            self._engram_prefetched: dict[str, int] = {}
++        if budget <= 0 or not input_batch.has_prefill:
++            self._engram_prefetched = {}
++            return None
++        done, spans, left, live = self._engram_prefetched, [], budget, {}
++        for i in range(input_batch.num_reqs):
++            if not input_batch.is_prefilling_np[i]:
++                continue
++            req_id = input_batch.req_ids[i]
++            after = int(input_batch.num_computed_prefill_tokens_np[i]) + int(
++                input_batch.num_scheduled_tokens[i]
++            )
++            start = max(after, done.get(req_id, 0))
++            stop = min(int(input_batch.prefill_len_np[i]), after + budget, start + left)
++            if stop > start:
++                spans.append((int(input_batch.idx_mapping_np[i]), start, stop))
++                left -= stop - start
++            live[req_id] = max(stop, done.get(req_id, 0))
++        self._engram_prefetched = live
++        if not spans:
++            return None
++        return self._engram_hash_inputs(spans, input_batch, req_states, window)
++
++    def _engram_hash_inputs(
++        self,
++        spans: list[tuple[int, int, int]],
++        input_batch: InputBatch,
++        req_states: RequestState,
++        window: torch.Tensor,
++    ) -> tuple[torch.Tensor, ...]:
++        """(req_state_idx, start, stop) prompt spans -> the n-gram hash inputs the runner
++        would build if it prefilled exactly those spans as one batch."""
++        lengths = np.array([b - a for _, a, b in spans], dtype=np.int64)
++        rows = np.repeat(np.array([r for r, _, _ in spans], dtype=np.int64), lengths)
++        cols = np.concatenate([np.arange(a, b, dtype=np.int64) for _, a, b in spans])
++        query_start_loc = np.zeros(len(spans) + 1, dtype=np.int32)
++        query_start_loc[1:] = np.cumsum(lengths)
++        # Lookback column c holds the token at chunk start - 1 - c (_gather_lookback_kernel).
++        depth = window.shape[1]
++        back = np.array([[a - 1 - c for c in range(depth)] for _, a, _ in spans], dtype=np.int64)
++        back_rows = np.repeat(np.array([[r] for r, _, _ in spans], dtype=np.int64), depth, axis=1)
++        tokens = req_states.all_token_ids.gpu
++        dev = window.device
++        rows_t, cols_t = torch.from_numpy(rows).to(dev), torch.from_numpy(cols).to(dev)
++        back_t = torch.from_numpy(back).to(dev)
++        lookback = torch.where(
++            back_t >= 0,
++            tokens[torch.from_numpy(back_rows).to(dev), back_t.clamp(min=0)],
++            torch.full((), -1, dtype=tokens.dtype, device=dev),
++        ).to(window.dtype)
++        return (
++            tokens[rows_t, cols_t].to(input_batch.input_ids.dtype),
++            cols_t.to(input_batch.positions.dtype),
++            torch.from_numpy(query_start_loc).to(dev),
++            lookback,
++        )
++
 +    def _engram_prestage_model(self):
 +        """The DeepseekV4Model that owns the engram hash state, behind the
 +        ForCausalLM wrapper and, for the VL entry point, language_model."""
