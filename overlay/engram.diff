@@ -1,6 +1,14 @@
 --- overlay/base/engram.py	2026-10-26 01:11:39.000000000 -0700
-+++ overlay/engram.py	2026-10-26 06:09:56.598685605 -0700
-@@ -942,6 +942,13 @@
++++ overlay/engram.py	2026-10-26 13:34:07.617427570 -0700
+@@ -38,6 +38,7 @@
+ import mmap
+ import os
+ import tempfile
++import time
+ import weakref
+ from contextlib import ExitStack
+ 
+@@ -942,6 +943,13 @@
  # 2026-09-28: DSV41_ENGRAM_INT4=1 serves Engram tables re-encoded by convert_engram_int4.py: packed int4 rows
  # (nibble = q + 8, two per byte) with fp16 per-32 scales. 144 B/row instead of 264 -> ~45% less pinned host RAM.
  _ENGRAM_INT4 = os.environ.get("DSV41_ENGRAM_INT4", "0") == "1"
@@ -14,7 +22,7 @@
  
  
  @triton.jit
-@@ -1021,6 +1028,8 @@
+@@ -1021,6 +1029,8 @@
          super().__init__()
          assert head_sizes and all(size > 0 for size in head_sizes)
          assert sum(head_sizes) <= num_embeddings
@@ -23,7 +31,7 @@
          self.cpu_offload = cpu_offload
          self.dp_shared_memory = dp_shared_memory
          self.use_thp = use_thp
-@@ -1092,6 +1101,12 @@
+@@ -1092,6 +1102,12 @@
          return self.tp_size * self.dp_size, engram_head_shard_rank()
  
      def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -36,7 +44,7 @@
          if getattr(self, "int4", False):
              # packed int4 rows (dim/2 bytes) + fp16 per-block scales; pinned host memory for UVA reads when offloaded
              kw = {"device": "cpu", "pin_memory": True} if self.cpu_offload else {}
-@@ -1183,6 +1198,8 @@
+@@ -1183,6 +1199,8 @@
          rows = indices.shape[0] * self.part_n_hash_cols
          if not rows:
              return
@@ -45,7 +53,15 @@
          weight, scales = self._storage()
          ids_stride_t, ids_stride_h = indices.stride()
          sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
-@@ -1648,6 +1665,30 @@
+@@ -1598,6 +1616,7 @@
+     _prefetch_stream: torch.cuda.Stream | None = None
+     _prefetch_done: torch.cuda.Event | None = None
+     _batch: EngramBatch | None = None
++    _pending: tuple | None = None
+ 
+     def __init__(
+         self,
+@@ -1648,6 +1667,52 @@
  
          max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
          self._init_staging(max_tokens, layout.head_dim)
@@ -58,15 +74,37 @@
 +                self.staged_rows.device,
 +            )
 +
-+    def prestage_start(self, hash_ids: torch.Tensor):
++    def prestage_start(self, hash_ids: torch.Tensor, lazy: bool = False):
 +        """DSV41_ENGRAM_SSD: start reading this step's rows (hash_ids
-+        [T, n_hash_cols] on the CPU); prestage_finish stages them into staged_rows."""
++        [T, n_hash_cols] on the CPU); prestage_finish stages them into staged_rows.
++        lazy=True: the reads wait for prestage_begin."""
 +        assert self.ssd_table is not None
-+        return self.ssd_table.start(hash_ids)
++        return self.ssd_table.start(hash_ids, lazy)
++
++    def prestage_begin(self, state) -> None:
++        assert self.ssd_table is not None
++        self.ssd_table.begin(state)
 +
 +    def prestage_finish(self, state) -> None:
 +        assert self.ssd_table is not None
 +        self.ssd_table.finish(state, self.staged_rows)
++
++    def prestage_defer(self, state, then) -> None:
++        """DSV41_ENGRAM_SSD_DEFER: stage this step's rows when the forward reaches this layer
++        (_ready_rows) instead of before the forward, so the reads overlap the layers before
++        it, as Project Maya's engine does; then(wait_s) runs once they are staged."""
++        if self._pending is not None:
++            raise RuntimeError("engram prestage: the previous step's deferred rows were never staged")
++        self._pending = (state, then)
++
++    def _finish_deferred(self) -> None:
++        state, then = self._pending
++        self._pending = None
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("engram prestage: deferred rows reached a CUDA graph capture")
++        t0 = time.perf_counter()
++        self.prestage_finish(state)
++        then(time.perf_counter() - t0)
 +
 +    def prestage_prefetch(self, hash_ids: torch.Tensor) -> int:
 +        """DSV41_ENGRAM_SSD_PREFETCH: start faulting in the rows of prompt tokens a later
@@ -76,3 +114,12 @@
  
      def _create_embedding(
          self, layout: EngramLayout, layer_hash_index: int
+@@ -1718,6 +1783,8 @@
+         torch.cuda.current_stream().wait_event(event)
+ 
+     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
++        if self._pending is not None:
++            self._finish_deferred()
+         if self._prefetch_done is not None:
+             self._finish_prefetch(self._prefetch_done)
+         if self.embed_tokens.dp_size > 1:

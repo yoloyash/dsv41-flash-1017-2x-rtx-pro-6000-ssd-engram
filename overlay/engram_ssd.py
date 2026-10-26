@@ -8,6 +8,10 @@ them into the layer's persistent `staged_rows` with the stock int4 lookup kernel
 forward then only reads `staged_rows`. The bytes and the dequant kernel are the stock ones, so
 the WKV input is bit-identical to the pinned-RAM path.
 
+Prefill chunks (DSV41_ENGRAM_SSD_DEFER=1) run eagerly, so they skip the wait before the forward:
+layer 1's rows are read first and staged when the forward reaches layer 1, then layer 14's are
+read while layers 1-13 compute and staged when it reaches layer 14 (Project Maya's ordering).
+
 Port of nktlabs/dsv41-flash-engram-disk-prestage (MIT) to the int4 tables of
 diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000 and this vLLM nightly. Differences from
 it: int4 rows (128 B nibbles + 16 B fp16 scales, separate tensors) instead of FP8, rows gathered
@@ -191,6 +195,7 @@ class SsdEngramTable:
             weight_map = json.load(fh)["weight_map"]
         prefix = f"layers.{layer_id}.engram.embed"
         self.emb = emb
+        self.layer_id = layer_id
         self.dim, self.block = emb.dim, emb.block_size
         self.w = _ShardView(os.path.join(model_dir, weight_map[f"{prefix}.weight"]), f"{prefix}.weight", self.dim // 2)
         self.s = _ShardView(os.path.join(model_dir, weight_map[f"{prefix}.scale"]), f"{prefix}.scale",
@@ -286,9 +291,10 @@ class SsdEngramTable:
             pool.submit(work, lo)
         return n
 
-    def start(self, hashes: torch.Tensor) -> tuple | None:
+    def start(self, hashes: torch.Tensor, lazy: bool = False) -> list | None:
         """hashes: [T, n_hash_cols] int32 CPU (this layer). Starts the row gather; finish()
-        completes it. Layers start before any finishes, so their reads overlap."""
+        completes it. Layers start before any finishes, so their reads overlap; lazy=True
+        leaves the reads to begin() (or finish())."""
         emb = self.emb
         t = hashes.shape[0]
         n = t * self.local_heads
@@ -303,7 +309,12 @@ class SsdEngramTable:
         evict_loaded_shards(self.model_dir)
         # Host staging is reused every step: the previous step's copies must be done reading it.
         self._copied.synchronize()
-        return t, n, rows, owned, self._submit(idx, n)
+        return [t, n, rows, owned, idx, None if lazy else self._submit(idx, n)]
+
+    def begin(self, state: list | None) -> None:
+        """Submit a lazy start()'s reads (no-op once submitted)."""
+        if state is not None and state[5] is None:
+            state[5] = self._submit(state[4], state[1])
 
     def finish(self, state: tuple | None, staged_rows: torch.Tensor) -> None:
         """Fills staged_rows[:T] on the current stream with exactly what the stock lookup writes."""
@@ -312,7 +323,8 @@ class SsdEngramTable:
 
         if state is None:
             return
-        t, n, rows, owned, futs = state
+        self.begin(state)
+        t, n, rows, owned, _, futs = state
         for fut in futs:
             fut.result()
         # Compact ids: row i of the staged table is token i // LH, head i % LH; -1 = not owned,

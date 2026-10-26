@@ -135,7 +135,12 @@ class _PrestageStats:
 
         self.every = int(os.environ.get("DSV41_ENGRAM_SSD_LOG_EVERY", "500"))
         self.rows: list[tuple[int, float, float, int]] = []
+        self.waits: dict[int, list[float]] = {}
         self.checked = 0
+
+    def wait(self, layer: int, seconds: float) -> None:
+        """A deferred layer's wait for its rows once the forward reached it."""
+        self.waits.setdefault(layer, []).append(seconds)
 
     def record(self, tokens: int, hash_s: float, stage_s: float, prefetched: int = 0) -> None:
         self.rows.append((tokens, hash_s, stage_s, prefetched))
@@ -143,17 +148,25 @@ class _PrestageStats:
             return
         import statistics as st
 
-        def ms(i: int, q: float) -> float:
-            vals = sorted(r[i] for r in self.rows)
-            return 1e3 * vals[min(len(vals) - 1, int(q * len(vals)))]
+        def q(vals: list[float], p: float) -> float:
+            vals = sorted(vals)
+            return 1e3 * vals[min(len(vals) - 1, int(p * len(vals)))]
 
+        def ms(i: int, p: float) -> float:
+            return q([r[i] for r in self.rows], p)
+
+        waits = "".join(
+            f", layer {layer} deferred wait p50 {q(v, .5):.2f} max {q(v, 1):.2f} ms ({len(v)} steps)"
+            for layer, v in sorted(self.waits.items())
+        )
         logger.info(
             "engram prestage %d steps, mean tokens %.1f: hash+sync p50 %.2f p99 %.2f ms, "
-            "row gather+stage p50 %.2f p99 %.2f ms, prefetched tokens %d, hash checks %d",
+            "row gather+stage p50 %.2f p99 %.2f ms, prefetched tokens %d, hash checks %d%s",
             len(self.rows), st.mean(r[0] for r in self.rows), ms(1, .5), ms(1, .99),
-            ms(2, .5), ms(2, .99), sum(r[3] for r in self.rows), self.checked,
+            ms(2, .5), ms(2, .99), sum(r[3] for r in self.rows), self.checked, waits,
         )
         self.rows.clear()
+        self.waits.clear()
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -923,6 +936,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self._prestage_dummy_block_table = torch.zeros((1, 1), dtype=torch.int32)
             self._prestage_dummy_slot_mapping = torch.zeros((1,), dtype=torch.int64)
             self._prestage_stats = _PrestageStats()
+            # DSV41_ENGRAM_SSD_DEFER=1: steps this big run eagerly (above every captured
+            # graph size), so each layer can wait for its rows inside the forward.
+            import os
+
+            self._defer_min_tokens: int | None = None
+            if os.environ.get("DSV41_ENGRAM_SSD_DEFER", "0") == "1":
+                graph_max = vllm_config.compilation_config.max_cudagraph_capture_size or 0
+                self._defer_min_tokens = max(
+                    int(os.environ.get("DSV41_ENGRAM_SSD_DEFER_MIN_TOKENS", "512")), graph_max + 1
+                )
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -990,7 +1013,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for layer in islice(self.layers, self.start_layer, self.end_layer)
             if getattr(layer, "engram", None) is not None
         ]
-        states = [e.prestage_start(hashes_cpu[:, e.layer_hash_index]) for e in engrams]
+        if any(e._pending is not None for e in engrams):
+            raise RuntimeError("engram prestage: the previous step's deferred rows were never staged")
+        # DSV41_ENGRAM_SSD_DEFER=1: a layer's reads start only once the layer before has its
+        # rows (layer 1's reads get the SSD to themselves), and each layer waits only when the
+        # forward reaches it (layer 14's reads overlap layers 1-13).
+        defer = self._defer_min_tokens is not None and num_tokens >= self._defer_min_tokens
+        states = [
+            e.prestage_start(hashes_cpu[:, e.layer_hash_index], lazy=defer and i > 0)
+            for i, e in enumerate(engrams)
+        ]
         p_hashes = None
         if prefetch is not None:
             # Hashed while this step's rows are read; submitted only once they are in,
@@ -1006,14 +1038,35 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self._prestage_dummy_slot_mapping,
                 self._prestage_dummy_block_table,
             ).cpu()
-        for engram, state in zip(engrams, states):
-            engram.prestage_finish(state)
-        t2 = time.perf_counter()
-        prefetched = 0
-        if p_hashes is not None:
-            for e in engrams:
-                e.prestage_prefetch(p_hashes[:, e.layer_hash_index])
-            prefetched = p_hashes.shape[0]
+        prefetched = 0 if p_hashes is None else p_hashes.shape[0]
+
+        def submit_prefetch() -> None:
+            if p_hashes is not None:
+                for e in engrams:
+                    e.prestage_prefetch(p_hashes[:, e.layer_hash_index])
+
+        if defer:
+            # The prefetch goes out once the last layer is staged.
+            stats = self._prestage_stats
+
+            def staged(i: int):
+                def then(wait_s: float) -> None:
+                    stats.wait(engrams[i].ssd_table.layer_id, wait_s)
+                    if i + 1 < len(engrams):
+                        engrams[i + 1].prestage_begin(states[i + 1])
+                    else:
+                        submit_prefetch()
+
+                return then
+
+            for i, (e, state) in enumerate(zip(engrams, states)):
+                e.prestage_defer(state, staged(i))
+            t2 = time.perf_counter()
+        else:
+            for engram, state in zip(engrams, states):
+                engram.prestage_finish(state)
+            t2 = time.perf_counter()
+            submit_prefetch()
         self.prestaged_tokens = num_tokens
         self._prestage_stats.record(num_tokens, t1 - t0, t2 - t1, prefetched)
 

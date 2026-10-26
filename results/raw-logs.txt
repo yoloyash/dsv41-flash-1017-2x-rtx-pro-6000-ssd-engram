@@ -112,3 +112,25 @@ mean tokens 7702.0: hash+sync p50 24.34 p99 24.34 ms, row gather+stage p50 17.23
 decode 1 stream: 2K 150.1 | 46K median 143.5 tok/s (148.1 152.1 133.9 140.2 141.4 145.5 139.1 151.9 160.8 164.2) | decode 4 streams 46K median 249.3 agg (240.6 250.0 249.3)
 === final config memory after the decode bench
 memory.stat: anon 82.3 GiB, file 12.7 GiB; Engram tensors cached 11.3 of 103.0 GiB (scales: resident, 0.0 cached); host free 24 GB
+=== prefill A/B round 3: per-layer Engram wait (ENGRAM_SSD_DEFER), other settings default (EVICT=1 PREFETCH=16384 RESIDENT_SCALES=1, p375), 8 fresh slices per arm, each arm a fresh restart, run in the order below
+arm 10 defer-off [ENGRAM_SSD_DEFER=0 ENGRAM_SSD_LOG_EVERY=1]: ARM 10: A new text median 6959 tok/s (mean 6997) | B Engram warm median 9371 tok/s
+arm 11 defer-1 [ENGRAM_SSD_DEFER=1 ENGRAM_SSD_LOG_EVERY=1]: ARM 11: A new text median 6953 tok/s (mean 6922) | B Engram warm median 9412 tok/s
+arm 12 defer-2 [ENGRAM_SSD_DEFER=2 ENGRAM_SSD_LOG_EVERY=1]: ARM 12: A new text median 7457 tok/s (mean 7347) | B Engram warm median 9449 tok/s
+arm 13 defer-2-again [ENGRAM_SSD_DEFER=2 ENGRAM_SSD_LOG_EVERY=1]: ARM 13: A new text median 7263 tok/s (mean 7235) | B Engram warm median 9537 tok/s
+arm 14 defer-1-again [ENGRAM_SSD_DEFER=1 ENGRAM_SSD_LOG_EVERY=1]: ARM 14: A new text median 6917 tok/s (mean 6662) | B Engram warm median 9285 tok/s
+arm 15 defer-off-again [ENGRAM_SSD_DEFER=0 ENGRAM_SSD_LOG_EVERY=1]: ARM 15: A new text median 6775 tok/s (mean 6883) | B Engram warm median 9375 tok/s
+(DEFER=1 here: both layers read at once, each staged when the forward reaches it. DEFER=2: layer 14 read only once layer 1 is staged. DEFER=2 ships as ENGRAM_SSD_DEFER=1; the other mode was removed.)
+--- exposed Engram wait per new-text prompt, rank 0 (prestage gather+stage plus in-forward waits, ENGRAM_SSD_LOG_EVERY=1)
+arm 10: new-text prompts 8: exposed Engram wait per prompt median 1260 ms; chunk 1 median 1223 ms (1579 1513 1374 1250 1195 970 1112 930); chunk 2 median 19 ms
+arm 15: new-text prompts 8: exposed Engram wait per prompt median 1216 ms; chunk 1 median 1177 ms (2012 1660 1605 1201 1047 1152 1061 995); chunk 2 median 20 ms
+arm 11: new-text prompts 8: exposed Engram wait per prompt median 1160 ms; chunk 1 median 801 ms (1301 1130 898 738 864 657 620 685); chunk 2 median 351 ms
+arm 14: new-text prompts 8: exposed Engram wait per prompt median 1237 ms; chunk 1 median 832 ms (1524 1017 1090 844 818 819 817 749); chunk 2 median 388 ms
+arm 12: new-text prompts 8: exposed Engram wait per prompt median 842 ms; chunk 1 median 547 ms (1116 858 645 490 511 583 359 209); chunk 2 median 275 ms
+arm 13: new-text prompts 8: exposed Engram wait per prompt median 914 ms; chunk 1 median 623 ms (916 722 713 632 613 547 597 419); chunk 2 median 247 ms
+--- parity with the per-layer wait (EAGER=1 ENGRAM_SSD_CHECK=1), DEFER=1 and DEFER=2 runs: 45.8K prompt, 4 prompts at once (34.3K/24.5K/24.4K/26.9K), 4 decode streams; no mismatch, no traceback
+DEFER=1: engram prestage 50 steps, mean tokens 3128.6: hash+sync p50 2.27 p99 326.47 ms, row gather+stage p50 18.07 p99 36.10 ms, prefetched tokens 86645, hash checks 49, layer 1 deferred wait p50 943.69 max 1235.67 ms (10 steps), layer 14 deferred wait p50 22.41 max 37.14 ms (10 steps)
+DEFER=1: 149 hash-checked steps per rank, 64 rows per layer re-read and compared bit for bit every step, 0 failures
+DEFER=2: engram prestage 50 steps, mean tokens 3128.8: hash+sync p50 1.51 p99 111.88 ms, row gather+stage p50 17.57 p99 37.09 ms, prefetched tokens 99666, hash checks 49, layer 1 deferred wait p50 471.87 max 828.91 ms (10 steps), layer 14 deferred wait p50 21.93 max 25.90 ms (10 steps)
+DEFER=2: 149 hash-checked steps per rank, 64 rows per layer re-read and compared bit for bit every step, 0 failures
+=== SSD random-read rate vs span (fio 3.36 in ubuntu:24.04, O_DIRECT 4 KiB randread, libaio, shards 47+48 read-only, 10 s each)
+jobs=2 qd=128 span=110g: 197K IOPS | jobs=8 qd=64 span=110g: 196K | jobs=8 qd=128 span=110g: 194K | jobs=8 qd=64 span=20g: 294K

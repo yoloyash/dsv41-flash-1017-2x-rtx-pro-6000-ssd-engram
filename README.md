@@ -27,7 +27,7 @@ Raw output for every number: [`results/raw-logs.txt`](results/raw-logs.txt).
 
 | | diffbot | this repo |
 |---|---:|---:|
-| text the server has never seen | 11,157 – 11,467 | **6,925** |
+| text the server has never seen | 11,157 – 11,467 | **7,263 – 7,457** |
 | text whose Engram rows are already cached | — | 9,394 |
 
 **Quality and long context**
@@ -40,12 +40,12 @@ Raw output for every number: [`results/raw-logs.txt`](results/raw-logs.txt).
 | peak VRAM during it | 96.6 / 97.0 GB | 95.5 / 95.5 GB |
 
 Notes:
-- Prefill is [`bench/prefill_ab.py`](bench/prefill_ab.py): median of 8 never-seen slices of Python source, measured in the first
-  minutes after a restart (cold cache). A server that has been up for a while does better.
+- Prefill is [`bench/prefill_ab.py`](bench/prefill_ab.py): median of 8 never-seen slices of Python source (38K-60K tokens),
+  measured in the first minutes after a restart (cold cache), two runs. A server that has been up for a while does better.
 - Right after a boot, decode is slower until the page cache warms up (80.8 / 114.9 / 218.8 on an earlier version).
 - DSpark off: 84.3 / 87.3 / 205.2 tok/s. Leave it on.
-- Quality, the needle and DSpark-off were measured before prefetch / resident scales / eviction. Those don't change any row the
-  model sees, only speed.
+- Quality, the needle and DSpark-off were measured before prefetch / resident scales / eviction / per-layer wait. Those don't
+  change any row the model sees, only speed.
 
 ### What each change is worth
 
@@ -57,14 +57,18 @@ Prefill on new text, median tok/s, 8 fresh prompts and a restart per row (run-to
 | + evict loader pages from the page cache | 5,129 / 4,523 |
 | + evict + prefetch | 5,977 |
 | + evict + resident scales | 5,380 |
-| **+ evict + prefetch + resident scales (default)** | **6,925** |
+| + evict + prefetch + resident scales | 6,925 / 6,959 / 6,775 |
+| **+ per-layer wait (default)** | **7,457 / 7,263** |
 
-Decode went from 132.7 / 132.8 / 249.3 to 150.1 / 143.5 / 249.3 with all three on.
+The last row and the last two values above it are one session, run off / on / on / off with fresh text each time.
+
+Decode went from 132.7 / 132.8 / 249.3 to 150.1 / 143.5 / 249.3 with evict, prefetch and resident scales. The per-layer wait only
+changes prefill steps (512+ tokens, which run outside the CUDA graphs); decode steps take the same path as before.
 
 ### Test host
 
 Threadripper PRO 5955WX (Zen 3, no AVX-512, so diffbot's GPU-only path), 8x 16 GB DDR4-2933, 2x RTX PRO 6000 Workstation (600 W)
-on PCIe 4.0 x16, Engram shards on a WD_BLACK SN7100 4 TB (~227K random 4 KiB reads/s measured with fio), Linux 7.0.
+on PCIe 4.0 x16, Engram shards on a WD_BLACK SN7100 4 TB (~195K random 4 KiB reads/s across the tables' 110 GB, fio), Linux 7.0.
 
 ## Quick start
 
@@ -97,6 +101,7 @@ Every knob of diffbot's `serve.sh` still works (`PORT`, `SPEC`, `MAX_NUM_SEQS`, 
 | `ENGRAM_SSD_PREFETCH` | `16384` | tokens of the next prefill chunk to read ahead; `0` = off |
 | `ENGRAM_SSD_RESIDENT_SCALES` | `1` | keep the Engram scales in RAM (11.4 GiB); `0` gives that back |
 | `ENGRAM_SSD_EVICT` | `1` | drop the loader's leftover shard pages from the page cache after load |
+| `ENGRAM_SSD_DEFER` | `1` | prefill: wait for each Engram layer's rows only when the forward reaches that layer; `0` = all before |
 | `ENGRAM_SSD_THREADS` | `128` | row-gather threads |
 | `ENGRAM_SSD_CHECK` | `0` | parity mode |
 | `CONTAINER_MEM` | `120g` | container cap; page cache counts against it, so it is also the Engram cache size |
@@ -116,15 +121,20 @@ them inside the CUDA graphs. Here:
    scales now live in RAM: one read.
 4. **Eviction**: loading leaves ~35 GB of other shards in the page cache, and the kernel was evicting Engram pages first
    (`MADV_RANDOM` mappings get no recency since Linux 6.3). Before: 6.6 of 37.9 GiB cached was Engram. After: nearly all of it.
-5. **p375 plan**: diffbot's default plan with its 375 hottest host experts moved back to VRAM (+10% at 4 streams).
+5. **Per-layer wait** ([Project Maya](https://github.com/mw00/project-maya)'s ordering): prefill chunks run outside the CUDA
+   graphs, so they don't wait for every row before the forward. Layer 1's rows are read first, alone; layer 14's start once
+   layer 1's are in and load while layers 1-13 compute. A new prompt's Engram wait goes from ~1.24 s to ~0.88 s.
+6. **p375 plan**: diffbot's default plan with its 375 hottest host experts moved back to VRAM (+10% at 4 streams).
 
 Where the remaining gap is:
-- the first 16K chunk of a new prompt still waits ~1.2 s on cold reads (nothing runs before it to overlap with)
+- a new prompt still waits ~0.9 s on cold reads: ~0.6 s for layer 1's rows of the first chunk (nothing runs before them),
+  ~0.25 s on the second chunk, whose prefetch now starts at layer 14. The SSD's random-read rate is the limit
 - decode pays ~3 ms per step for the gather between steps
 - with every row cached, prefill is 9.4K vs 11.2K; not isolated, most likely PCIe 4.0 vs 5.0 for the host experts
 
-Tried and dropped: an io_uring reader (the SSD tops out at ~227K reads/s, which the threads already reach), and prefetching
-two chunks ahead (same as one).
+Tried and dropped: an io_uring reader (the SSD tops out at ~200K random reads/s, which the threads already reach), prefetching
+two chunks ahead (same as one), and the per-layer wait with both layers read at once (it moves ~0.4 s from the first chunk to the
+second: no gain).
 
 ## Fidelity
 
@@ -132,7 +142,7 @@ two chunks ahead (same as one).
   with and without resident scales.
 - Parity mode: each step re-reads sampled rows with `pread` and compares bit for bit, checks the hashes against the stock path, and
   checks that prefetch hashes the right tokens. 699 steps (long prompts, concurrent prefills, 16 decode streams, images): zero
-  mismatches.
+  mismatches. Two more runs with the per-layer wait on (a 46K prompt, four 24K-34K prompts at once, decode streams): zero.
 - GSM8K / HumanEval match diffbot's figures. Fidelity to the original weights is diffbot's (their `recipe/kl/`).
 
 ## Files
@@ -154,7 +164,7 @@ results/raw-logs.txt      every number above
 ## Credits
 
 **diffbot** (the pack, quantization, sm_120 vLLM overlay, kernels, plans, benchmarks), **nktlabs** (prestage design, parity mode,
-fail-loud guards), **local-inference-lab** (the prefetch and resident-scales ideas, b12x #360 / vLLM #736), **sfxnz** (the
-Engram-on-disk lineage), **turboderp** (ExLlamaV3), **coolbho3k** (calibration method), **vLLM**, **DeepSeek**. Details and
-licences: [`ATTRIBUTIONS.md`](ATTRIBUTIONS.md), [`NOTICE`](NOTICE). Code here is MIT except the three modified vLLM files in
+fail-loud guards), **local-inference-lab** (the prefetch and resident-scales ideas, b12x #360 / vLLM #736), **Project Maya** (the
+per-layer Engram wait), **sfxnz** (the Engram-on-disk lineage), **turboderp** (ExLlamaV3), **coolbho3k** (calibration method),
+**vLLM**, **DeepSeek**. Details and licences: [`ATTRIBUTIONS.md`](ATTRIBUTIONS.md), [`NOTICE`](NOTICE). Code here is MIT except the three modified vLLM files in
 `overlay/`, which stay Apache-2.0.

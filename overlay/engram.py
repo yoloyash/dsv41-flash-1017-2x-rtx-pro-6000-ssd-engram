@@ -38,6 +38,7 @@ import ctypes
 import mmap
 import os
 import tempfile
+import time
 import weakref
 from contextlib import ExitStack
 
@@ -1615,6 +1616,7 @@ class Engram(nn.Module):
     _prefetch_stream: torch.cuda.Stream | None = None
     _prefetch_done: torch.cuda.Event | None = None
     _batch: EngramBatch | None = None
+    _pending: tuple | None = None
 
     def __init__(
         self,
@@ -1674,15 +1676,37 @@ class Engram(nn.Module):
                 self.staged_rows.device,
             )
 
-    def prestage_start(self, hash_ids: torch.Tensor):
+    def prestage_start(self, hash_ids: torch.Tensor, lazy: bool = False):
         """DSV41_ENGRAM_SSD: start reading this step's rows (hash_ids
-        [T, n_hash_cols] on the CPU); prestage_finish stages them into staged_rows."""
+        [T, n_hash_cols] on the CPU); prestage_finish stages them into staged_rows.
+        lazy=True: the reads wait for prestage_begin."""
         assert self.ssd_table is not None
-        return self.ssd_table.start(hash_ids)
+        return self.ssd_table.start(hash_ids, lazy)
+
+    def prestage_begin(self, state) -> None:
+        assert self.ssd_table is not None
+        self.ssd_table.begin(state)
 
     def prestage_finish(self, state) -> None:
         assert self.ssd_table is not None
         self.ssd_table.finish(state, self.staged_rows)
+
+    def prestage_defer(self, state, then) -> None:
+        """DSV41_ENGRAM_SSD_DEFER: stage this step's rows when the forward reaches this layer
+        (_ready_rows) instead of before the forward, so the reads overlap the layers before
+        it, as Project Maya's engine does; then(wait_s) runs once they are staged."""
+        if self._pending is not None:
+            raise RuntimeError("engram prestage: the previous step's deferred rows were never staged")
+        self._pending = (state, then)
+
+    def _finish_deferred(self) -> None:
+        state, then = self._pending
+        self._pending = None
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("engram prestage: deferred rows reached a CUDA graph capture")
+        t0 = time.perf_counter()
+        self.prestage_finish(state)
+        then(time.perf_counter() - t0)
 
     def prestage_prefetch(self, hash_ids: torch.Tensor) -> int:
         """DSV41_ENGRAM_SSD_PREFETCH: start faulting in the rows of prompt tokens a later
@@ -1759,6 +1783,8 @@ class Engram(nn.Module):
         torch.cuda.current_stream().wait_event(event)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+        if self._pending is not None:
+            self._finish_deferred()
         if self._prefetch_done is not None:
             self._finish_prefetch(self._prefetch_done)
         if self.embed_tokens.dp_size > 1:
