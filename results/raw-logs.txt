@@ -134,3 +134,64 @@ DEFER=2: engram prestage 50 steps, mean tokens 3128.8: hash+sync p50 1.51 p99 11
 DEFER=2: 149 hash-checked steps per rank, 64 rows per layer re-read and compared bit for bit every step, 0 failures
 === SSD random-read rate vs span (fio 3.36 in ubuntu:24.04, O_DIRECT 4 KiB randread, libaio, shards 47+48 read-only, 10 s each)
 jobs=2 qd=128 span=110g: 197K IOPS | jobs=8 qd=64 span=110g: 196K | jobs=8 qd=128 span=110g: 194K | jobs=8 qd=64 span=20g: 294K
+=== adaptive DSpark verification (enable_adaptive_verification=true via a second --speculative-config): vLLM refuses to start
+ValueError: Adaptive verification trims verification requests on device, which the DeepseekV41IndexerBackend attention backend does not support. Pass enable_adaptive_verification=false in the speculative config, or use a backend that does.
+(DeepseekV32IndexerBackend.supports_device_cpu_query_lens_mismatch: varlen paged MQA logits on capability family 100, or flattened queries on 90; sm_120 has neither)
+=== native row gather (ENGRAM_SSD_NATIVE): CPU-only microbenchmark in the serving image, layer-1 shard, both layers in flight like a
+decode step; 23% of owned rows new random rows per step (so partly cold), resident-scales-like second table; p50 of 300 steps
+1 stream (6 tok, 144 rows)    Python pool: p50 2.761 / 2.748 ms   native: p50 0.583 / 0.575 ms
+4 streams (24 tok, 576 rows)  Python pool: p50 9.978 / 9.984 ms   native: p50 1.426 / 1.369 ms
+prefill 16K chunk (393K rows, all new, one layer)  Python pool: p50 580 ms   native: p50 522 ms
+native output == torch.index_select at n = 1, 7, 576, 100000; detached job with inputs dropped by Python: equal; out-of-range id: raises
+=== tests/test_engram_ssd.py with the native gather on and off (one GPU, no model load)
+== NATIVE=1 RESIDENT_SCALES=0 layer 1 rank 0
+T=    1 rows=    12 total  1010.23 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   115.51 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   125.67 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   206.43 ms  bit-identical to stock kernel: True
+OK
+== NATIVE=1 RESIDENT_SCALES=1 layer 14 rank 1
+T=    1 rows=    12 total   792.56 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   125.26 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   124.22 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   112.38 ms  bit-identical to stock kernel: True
+OK
+== NATIVE=0 RESIDENT_SCALES=0 layer 1 rank 1
+T=    1 rows=    12 total   812.33 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   123.75 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   127.18 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   185.20 ms  bit-identical to stock kernel: True
+OK
+== NATIVE=0 RESIDENT_SCALES=1 layer 14 rank 0
+T=    1 rows=    12 total   816.50 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   125.35 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   140.61 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   125.89 ms  bit-identical to stock kernel: True
+OK
+=== parity with the native gather on (EAGER=1 ENGRAM_SSD_CHECK=1): 49.9K prompt, 4 prompts at once (30.3K/25.5K/24.2K/23.8K), 4 decode
+streams; 199 hash-checked steps per rank, 64 rows per layer re-read and compared bit for bit every step, 0 failures, no traceback.
+Then decode/prefill arms, one session, each a fresh restart, run in the order below; prefill on 8 fresh slices per arm, decode =
+bench-fixed.py measured pass (after a warm pass); "engram prestage" = the last 200-step stats lines of the arm (both ranks)
+parity OK: 8 stat lines, native row gather ready (15.5 s)
+  engram prestage 50 steps, mean tokens 20.2: hash+sync p50 28.83 p99 55.58 ms, row gather+stage p50 16.14 p99 34.86 ms, prefetched tokens 0, hash checks 199
+  engram prestage 50 steps, mean tokens 20.2: hash+sync p50 29.23 p99 55.01 ms, row gather+stage p50 18.39 p99 37.11 ms, prefetched tokens 0, hash checks 199
+arm 16 native-off [ENGRAM_SSD_NATIVE=0]: ARM 16: A new text median 7561 tok/s (mean 7373) | B Engram warm median 9478 tok/s
+  decode: decode 1 stream: 2K 143.9 | 46K median 144.6 tok/s (132.1 155.7 156.1 130.8 146.5 135.4 145.3 144.0 142.0 165.0) | decode 4 streams 46K median 258.2 agg (257.3 258.2 268.4)
+  engram prestage 200 steps, mean tokens 26.3: hash+sync p50 20.10 p99 153.28 ms, row gather+stage p50 2.68 p99 16.77 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.31 max 0.31 ms (2 steps), layer 14 deferred wait p50 0.33 max 0.33 ms (2 steps)
+  engram prestage 200 steps, mean tokens 29.5: hash+sync p50 37.01 p99 105.21 ms, row gather+stage p50 4.11 p99 12.26 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.23 max 0.23 ms (2 steps), layer 14 deferred wait p50 0.24 max 0.24 ms (2 steps)
+  engram prestage 200 steps, mean tokens 29.5: hash+sync p50 35.17 p99 105.15 ms, row gather+stage p50 5.49 p99 14.55 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.32 max 0.32 ms (2 steps), layer 14 deferred wait p50 0.31 max 0.31 ms (2 steps)
+arm 17 native-on [ENGRAM_SSD_NATIVE=1]: ARM 17: A new text median 7523 tok/s (mean 7628) | B Engram warm median 9427 tok/s
+  decode: decode 1 stream: 2K 157.3 | 46K median 156.1 tok/s (164.2 150.3 138.4 149.9 160.2 156.5 157.7 158.0 155.8 152.2) | decode 4 streams 46K median 269.0 agg (266.0 272.5 269.0)
+  engram prestage 200 steps, mean tokens 29.1: hash+sync p50 32.99 p99 137.58 ms, row gather+stage p50 1.71 p99 3.49 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.18 max 0.18 ms (2 steps), layer 14 deferred wait p50 0.18 max 0.18 ms (2 steps)
+  engram prestage 200 steps, mean tokens 37.0: hash+sync p50 33.08 p99 82.41 ms, row gather+stage p50 1.92 p99 3.37 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.19 max 0.20 ms (4 steps), layer 14 deferred wait p50 0.16 max 0.17 ms (4 steps)
+  engram prestage 200 steps, mean tokens 37.0: hash+sync p50 32.57 p99 82.40 ms, row gather+stage p50 1.95 p99 3.46 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.18 max 0.19 ms (4 steps), layer 14 deferred wait p50 0.18 max 0.18 ms (4 steps)
+arm 20 native-on-again [ENGRAM_SSD_NATIVE=1]: ARM 20: A new text median 8131 tok/s (mean 7902) | B Engram warm median 9612 tok/s
+  decode: decode 1 stream: 2K 147.8 | 46K median 156.0 tok/s (145.5 150.2 147.2 147.7 160.7 164.4 144.6 165.4 151.2 173.3) | decode 4 streams 46K median 269.7 agg (251.7 269.7 285.7)
+  engram prestage 200 steps, mean tokens 24.6: hash+sync p50 16.99 p99 132.96 ms, row gather+stage p50 1.11 p99 3.26 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.19 max 0.19 ms (2 steps), layer 14 deferred wait p50 0.17 max 0.17 ms (2 steps)
+  engram prestage 200 steps, mean tokens 30.2: hash+sync p50 36.62 p99 82.85 ms, row gather+stage p50 2.21 p99 3.59 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.19 max 0.19 ms (2 steps), layer 14 deferred wait p50 0.18 max 0.18 ms (2 steps)
+  engram prestage 200 steps, mean tokens 30.2: hash+sync p50 36.48 p99 82.86 ms, row gather+stage p50 2.22 p99 3.59 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.20 max 0.20 ms (2 steps), layer 14 deferred wait p50 0.16 max 0.16 ms (2 steps)
+arm 21 native-off-again [ENGRAM_SSD_NATIVE=0]: ARM 21: A new text median 7419 tok/s (mean 7261) | B Engram warm median 9387 tok/s
+  decode: decode 1 stream: 2K 154.1 | 46K median 138.6 tok/s (141.3 166.9 137.6 136.0 139.6 125.1 146.2 136.1 151.7 166.1) | decode 4 streams 46K median 271.3 agg (271.3 277.7 262.1)
+  engram prestage 200 steps, mean tokens 30.1: hash+sync p50 32.68 p99 130.45 ms, row gather+stage p50 5.05 p99 15.99 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.36 max 0.36 ms (2 steps), layer 14 deferred wait p50 0.31 max 0.31 ms (2 steps)
+  engram prestage 200 steps, mean tokens 38.4: hash+sync p50 34.73 p99 108.30 ms, row gather+stage p50 4.60 p99 14.62 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.33 max 0.38 ms (4 steps), layer 14 deferred wait p50 0.25 max 0.28 ms (4 steps)
+  engram prestage 200 steps, mean tokens 38.4: hash+sync p50 33.18 p99 108.33 ms, row gather+stage p50 5.37 p99 15.40 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.35 max 0.44 ms (4 steps), layer 14 deferred wait p50 0.30 max 0.30 ms (4 steps)

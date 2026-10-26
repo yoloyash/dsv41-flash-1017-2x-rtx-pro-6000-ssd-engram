@@ -19,9 +19,9 @@ Raw output for every number: [`results/raw-logs.txt`](results/raw-logs.txt).
 
 | | diffbot | this repo |
 |---|---:|---:|
-| 1 stream, 2K prompt | 156.9 | **150.1** |
-| 1 stream, 46K prompt | 172.8 | **143.5** |
-| 4 streams, 46K prompts, aggregate | 362.9 | **249.3** |
+| 1 stream, 2K prompt | 156.9 | **147.8 – 157.3** |
+| 1 stream, 46K prompt | 172.8 | **156.0 – 156.1** |
+| 4 streams, 46K prompts, aggregate | 362.9 | **269.0 – 269.7** |
 
 **Prefill**, tok/s, ~40K-token prompt, nothing in the KV cache
 
@@ -40,6 +40,7 @@ Raw output for every number: [`results/raw-logs.txt`](results/raw-logs.txt).
 | peak VRAM during it | 96.6 / 97.0 GB | 95.5 / 95.5 GB |
 
 Notes:
+- Decode: two runs (restart per run).
 - Prefill is [`bench/prefill_ab.py`](bench/prefill_ab.py): median of 8 never-seen slices of Python source (38K-60K tokens),
   measured in the first minutes after a restart (cold cache), two runs. A server that has been up for a while does better.
 - Right after a boot, decode is slower until the page cache warms up (80.8 / 114.9 / 218.8 on an earlier version).
@@ -62,8 +63,18 @@ Prefill on new text, median tok/s, 8 fresh prompts and a restart per row (run-to
 
 The last row and the last two values above it are one session, run off / on / on / off with fresh text each time.
 
-Decode went from 132.7 / 132.8 / 249.3 to 150.1 / 143.5 / 249.3 with evict, prefetch and resident scales. The per-layer wait only
-changes prefill steps (512+ tokens, which run outside the CUDA graphs); decode steps take the same path as before.
+Decode (1 stream 2K / 1 stream 46K / 4 streams), tok/s:
+
+| | tok/s |
+|---|---|
+| prestage only | 132.7 / 132.8 / 249.3 |
+| + evict + prefetch + resident scales | 150.1 / 143.5 / 249.3 |
+| same, a later session (start / end) | 143.9 / 144.6 / 258.2, 154.1 / 138.6 / 271.3 |
+| **+ native row gather (default)**, same session | **157.3 / 156.1 / 269.0, 147.8 / 156.0 / 269.7** |
+
+The native gather is worth ~+10% on one 46K stream (both runs above both runs without it); at 2K and at four streams the runs
+overlap. It leaves prefill where it was (7,561 / 7,419 without, 7,523 / 8,131 with). The per-layer wait only changes prefill steps
+(512+ tokens, which run outside the CUDA graphs); decode steps take the same path as before.
 
 ### Test host
 
@@ -102,6 +113,7 @@ Every knob of diffbot's `serve.sh` still works (`PORT`, `SPEC`, `MAX_NUM_SEQS`, 
 | `ENGRAM_SSD_RESIDENT_SCALES` | `1` | keep the Engram scales in RAM (11.4 GiB); `0` gives that back |
 | `ENGRAM_SSD_EVICT` | `1` | drop the loader's leftover shard pages from the page cache after load |
 | `ENGRAM_SSD_DEFER` | `1` | prefill: wait for each Engram layer's rows only when the forward reaches that layer; `0` = all before |
+| `ENGRAM_SSD_NATIVE` | `1` | row gather on a C++ thread pool (built at load); `0` = the Python pool |
 | `ENGRAM_SSD_THREADS` | `128` | row-gather threads |
 | `ENGRAM_SSD_CHECK` | `0` | parity mode |
 | `CONTAINER_MEM` | `120g` | container cap; page cache counts against it, so it is also the Engram cache size |
@@ -124,17 +136,23 @@ them inside the CUDA graphs. Here:
 5. **Per-layer wait** ([Project Maya](https://github.com/mw00/project-maya)'s ordering): prefill chunks run outside the CUDA
    graphs, so they don't wait for every row before the forward. Layer 1's rows are read first, alone; layer 14's start once
    layer 1's are in and load while layers 1-13 compute. A new prompt's Engram wait goes from ~1.24 s to ~0.88 s.
-6. **p375 plan**: diffbot's default plan with its 375 hottest host experts moved back to VRAM (+10% at 4 streams).
+6. **Native row gather**: the rows are copied by a small C++ thread pool ([`overlay/engram_gather.cpp`](overlay/engram_gather.cpp),
+   built into the torch extension cache at load, ~15 s the first time), a few rows at a time to whichever thread is free. A decode
+   step needs a few hundred rows, mostly cached, split into ~50 Python tasks per layer whose interpreter overhead was most of the
+   cost: the gather between decode steps (the GPU waits for it) took 2.7-5.5 ms, p99 12-17 ms, at four streams. Now 1.1-2.2 ms,
+   p99 ~3.5 ms.
+7. **p375 plan**: diffbot's default plan with its 375 hottest host experts moved back to VRAM (+10% at 4 streams).
 
 Where the remaining gap is:
 - a new prompt still waits ~0.9 s on cold reads: ~0.6 s for layer 1's rows of the first chunk (nothing runs before them),
   ~0.25 s on the second chunk, whose prefetch now starts at layer 14. The SSD's random-read rate is the limit
-- decode pays ~3 ms per step for the gather between steps
+- decode still waits ~1-2 ms per step between steps (hash, gather, copy, dequant), with the GPU idle
 - with every row cached, prefill is 9.4K vs 11.2K; not isolated, most likely PCIe 4.0 vs 5.0 for the host experts
 
-Tried and dropped: an io_uring reader (the SSD tops out at ~200K random reads/s, which the threads already reach), prefetching
-two chunks ahead (same as one), and the per-layer wait with both layers read at once (it moves ~0.4 s from the first chunk to the
-second: no gain).
+Tried and dropped: vLLM's adaptive DSpark verification (`enable_adaptive_verification`: it needs a variable-length indexer
+kernel that exists for sm_90 and sm_100 only, so vLLM refuses to start with it on sm_120), an io_uring reader (the SSD tops out
+at ~200K random reads/s, which the threads already reach), prefetching two chunks ahead (same as one), and the per-layer wait
+with both layers read at once (it moves ~0.4 s from the first chunk to the second: no gain).
 
 ## Fidelity
 
@@ -142,13 +160,16 @@ second: no gain).
   with and without resident scales.
 - Parity mode: each step re-reads sampled rows with `pread` and compares bit for bit, checks the hashes against the stock path, and
   checks that prefetch hashes the right tokens. 699 steps (long prompts, concurrent prefills, 16 decode streams, images): zero
-  mismatches. Two more runs with the per-layer wait on (a 46K prompt, four 24K-34K prompts at once, decode streams): zero.
+  mismatches. Two more runs with the per-layer wait on (a 46K prompt, four 24K-34K prompts at once, decode streams): zero. One
+  with the native gather on (a 50K prompt, four 24K-30K prompts at once, decode streams; 199 hash-checked steps per rank): zero.
+  The bit-identity test passes with the native gather on and off.
 - GSM8K / HumanEval match diffbot's figures. Fidelity to the original weights is diffbot's (their `recipe/kl/`).
 
 ## Files
 
 ```
 overlay/engram_ssd.py     new: shard reader, gather, prefetch, resident scales, eviction, parity check
+overlay/engram_gather.cpp new: the native row gather (built at load with torch.utils.cpp_extension)
 overlay/engram.py         vLLM files from diffbot's image + hooks; .diff files show the changes
 overlay/model.py
 overlay/model_state.py

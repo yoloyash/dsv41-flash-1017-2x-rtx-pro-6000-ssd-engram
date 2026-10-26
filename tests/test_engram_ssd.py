@@ -3,8 +3,10 @@ Run inside the serving image with the overlay mounted, one GPU, no model load.
 Run from the repo root:
     VP=/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41
     docker run --rm --gpus device=0 -v $PACK:$PACK:ro -v $PWD/overlay/engram_ssd.py:$VP/common/engram_ssd.py:ro \
-      -v $PWD/overlay/engram.py:$VP/common/engram.py:ro -v $PWD/tests:/t:ro -e DSV41_ENGRAM_INT4=1 \
-      --entrypoint python3 dsv41-flash-1017-exl3-3bpw-sm120 /t/test_engram_ssd.py $PACK <layer 1|14> <rows 384006168|384016682> <tp rank 0|1>"""
+      -v $PWD/overlay/engram.py:$VP/common/engram.py:ro -v $PWD/overlay/engram_gather.cpp:$VP/common/engram_gather.cpp:ro \
+      -v $PWD/tests:/t:ro -e DSV41_ENGRAM_INT4=1 \
+      --entrypoint python3 dsv41-flash-1017-exl3-3bpw-sm120 /t/test_engram_ssd.py $PACK <layer 1|14> <rows 384006168|384016682> <tp rank 0|1>
+Add -e DSV41_ENGRAM_SSD_NATIVE=0 for the Python gather pool, -e DSV41_ENGRAM_SSD_RESIDENT_SCALES=1 for resident scales."""
 import sys, time, types, torch
 from vllm.models.deepseek_v41.common import engram_ssd as S
 from vllm.models.deepseek_v41.common.engram import _engram_lookup_int4_kernel

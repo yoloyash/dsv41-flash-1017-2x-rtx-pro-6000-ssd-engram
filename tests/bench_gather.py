@@ -3,8 +3,10 @@ Uniform-random ids = worst case (mostly cold pages); the same ids again = page-c
 Run from the repo root:
     VP=/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41
     docker run --rm --gpus device=0 -v $PACK:$PACK:ro -v $PWD/overlay/engram_ssd.py:$VP/common/engram_ssd.py:ro \
-      -v $PWD/overlay/engram.py:$VP/common/engram.py:ro -v $PWD/tests:/t:ro -e DSV41_ENGRAM_INT4=1 \
-      --entrypoint python3 dsv41-flash-1017-exl3-3bpw-sm120 /t/bench_gather.py $PACK"""
+      -v $PWD/overlay/engram.py:$VP/common/engram.py:ro -v $PWD/overlay/engram_gather.cpp:$VP/common/engram_gather.cpp:ro \
+      -v $PWD/tests:/t:ro -e DSV41_ENGRAM_INT4=1 \
+      --entrypoint python3 dsv41-flash-1017-exl3-3bpw-sm120 /t/bench_gather.py $PACK
+Add -e DSV41_ENGRAM_SSD_NATIVE=0 for the Python gather pool."""
 import sys, time, types, torch
 from vllm.models.deepseek_v41.common import engram_ssd as S
 pack = sys.argv[1]

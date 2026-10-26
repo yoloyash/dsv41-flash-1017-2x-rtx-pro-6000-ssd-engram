@@ -7,6 +7,7 @@
 #   ENGRAM_SSD_RESIDENT_SCALES=1  keep the Engram scales (11.4 GiB) in RAM: one SSD read per cold row instead of two
 #   ENGRAM_SSD_EVICT=1            after load, drop the other shards from the page cache so it holds Engram rows
 #   ENGRAM_SSD_DEFER=1            prefill: layer 14 rows read during layers 1-13, waited for only at layer 14; 0 = all before
+#   ENGRAM_SSD_NATIVE=1           row gather on a native thread pool (overlay/engram_gather.cpp, built at load); 0 = Python pool
 #   ENGRAM_SSD_THREADS=128        gather threads (a cold row is a page fault that blocks one); ENGRAM_SSD_MIN_CHUNK=8 rows/task
 #   ENGRAM_SSD_CHECK=0            1 = parity mode: re-read sampled rows with pread and compare bit for bit every step
 #   CONTAINER_MEM=120g            container cap (diffbot: 260g); page cache counts against it, so it caps the Engram cache too
@@ -24,7 +25,7 @@ VP=/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41
 O=$ROOT/overlay
 mounts=()
 if [[ $ENGRAM_SSD == 1 ]]; then
-  for f in common/engram.py common/engram_ssd.py nvidia/model.py nvidia/model_state.py; do
+  for f in common/engram.py common/engram_ssd.py common/engram_gather.cpp nvidia/model.py nvidia/model_state.py; do
     [[ -f $O/$(basename $f) ]] || { echo "missing $O/$(basename $f)"; exit 1; }
     mounts+=(-v "$O/$(basename $f):$VP/$f:ro")
   done
@@ -39,6 +40,7 @@ export DOCKER_EXTRA="${mounts[*]} -e DSV41_ENGRAM_SSD=$ENGRAM_SSD -e DSV41_ENGRA
 -e DSV41_ENGRAM_SSD_THREADS=${ENGRAM_SSD_THREADS:-128} -e DSV41_ENGRAM_SSD_MIN_CHUNK=${ENGRAM_SSD_MIN_CHUNK:-8} -e DSV41_ENGRAM_SSD_INLINE_ROWS=${ENGRAM_SSD_INLINE_ROWS:-0} -e DSV41_ENGRAM_SSD_LOG_EVERY=${ENGRAM_SSD_LOG_EVERY:-500} \
 -e DSV41_ENGRAM_SSD_EVICT=${ENGRAM_SSD_EVICT:-1} -e DSV41_ENGRAM_SSD_PREFETCH=${ENGRAM_SSD_PREFETCH:-16384} \
 -e DSV41_ENGRAM_SSD_PREFETCH_THREADS=${ENGRAM_SSD_PREFETCH_THREADS:-${ENGRAM_SSD_THREADS:-128}} \
--e DSV41_ENGRAM_SSD_RESIDENT_SCALES=${ENGRAM_SSD_RESIDENT_SCALES:-1} -e DSV41_ENGRAM_SSD_DEFER=${ENGRAM_SSD_DEFER:-1} ${DOCKER_EXTRA:-}"
+-e DSV41_ENGRAM_SSD_RESIDENT_SCALES=${ENGRAM_SSD_RESIDENT_SCALES:-1} -e DSV41_ENGRAM_SSD_DEFER=${ENGRAM_SSD_DEFER:-1} \
+-e DSV41_ENGRAM_SSD_NATIVE=${ENGRAM_SSD_NATIVE:-1} ${DOCKER_EXTRA:-}"
 echo "[serve-ssd] Engram on SSD: $([[ $ENGRAM_SSD == 1 ]] && echo "on (check ${ENGRAM_SSD_CHECK:-0})" || echo off), container memory $CONTAINER_MEM${SSD_PLAN:+, plan $SSD_PLAN (overrides the plan serve.sh prints below)}"
 exec bash "$RECIPE/serve/serve.sh" "$@"

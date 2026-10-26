@@ -18,6 +18,9 @@ it: int4 rows (128 B nibbles + 16 B fp16 scales, separate tensors) instead of FP
 with a threaded index_select over an mmap instead of one preadv per row (a 16K-token prefill
 chunk needs ~400K rows per rank), and dequant on the GPU with the stock kernel.
 
+Rows are copied by engram_gather.cpp (DSV41_ENGRAM_SSD_NATIVE=1) on its own thread pool: on a Python
+pool, a decode step's few hundred rows cost mostly interpreter overhead.
+
 Page cache: MADV_RANDOM is what keeps a 128-byte row from costing a 512 KiB read-around, but
 since Linux 6.3 (vma_has_recency) the kernel also ignores accessed bits on such mappings, so
 Engram pages are never promoted and lose every eviction to the shard pages the loader read
@@ -166,6 +169,47 @@ def _evict(model_dir: str) -> None:
 
 _POOL: ThreadPoolExecutor | None = None
 _PREFETCH_POOL: ThreadPoolExecutor | None = None
+_NATIVE = None   # the engram_gather extension, False if disabled or unbuildable
+_NATIVE_POOLS: dict[str, int] = {}
+
+
+def _native():
+    """DSV41_ENGRAM_SSD_NATIVE=1: engram_gather.cpp, built once into the torch extension cache."""
+    global _NATIVE
+    if _NATIVE is None:
+        _NATIVE = False
+        if os.environ.get("DSV41_ENGRAM_SSD_NATIVE", "1") == "1":
+            from torch.utils.cpp_extension import load
+
+            t0 = time.perf_counter()
+            src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engram_gather.cpp")
+            try:
+                _NATIVE = load("dsv41_engram_gather", [src], extra_cflags=["-O3"])
+                logger.info("Engram SSD: native row gather ready (%.1f s)", time.perf_counter() - t0)
+            except Exception as e:  # no compiler, no source: the Python pool still works
+                logger.warning("Engram SSD: native row gather unavailable, using the Python pool: %s", e)
+    return _NATIVE
+
+
+def _native_pool(name: str, threads: int) -> int:
+    if name not in _NATIVE_POOLS:
+        _NATIVE_POOLS[name] = _native().new_pool(threads)
+    return _NATIVE_POOLS[name]
+
+
+class _NativeJob:
+    """A started native gather; result() waits for it like a future."""
+
+    def __init__(self, pool: int, job: int) -> None:
+        self.pool, self.job = pool, job
+
+    def result(self) -> None:
+        _native().wait(self.pool, self.job)
+
+
+def _native_block(n: int, threads: int) -> int:
+    """Rows per claim: a few for decode-sized steps, ~16 claims per thread for prefill chunks."""
+    return max(4, -(-n // (16 * threads)))
 
 
 def _pool(threads: int) -> ThreadPoolExecutor:
@@ -220,6 +264,7 @@ class SsdEngramTable:
         self._pf_scratch: tuple[torch.Tensor, torch.Tensor] | None = None
         self.check = engram_ssd_check_enabled()
         self.model_dir = model_dir
+        _native()   # build now, not on the first request
         # DSV41_ENGRAM_SSD_RESIDENT_SCALES=1: this rank's fp16 scales (1/9 of the table) live in
         # host RAM, so a cold row costs one SSD read instead of two.
         self.s_res: torch.Tensor | None = None
@@ -249,6 +294,11 @@ class SsdEngramTable:
         Cold rows are page faults served one at a time per thread, so cold reads want many
         chunks; warm ones want few, as each chunk costs a pool round trip."""
         sidx, stab = self._scale_ids(idx), self._scale_table
+        if _native():
+            pool = _native_pool("step", self.threads)
+            job = _native().start(pool, self.w.table, idx, self.w_host, stab, sidx, self.s_host,
+                                  _native_block(n, self.threads), False)
+            return [_NativeJob(pool, job)]
         if n <= self.inline_rows:
             # Warm rows cost ~100 ns each; a pool round trip costs more than the gather.
             torch.index_select(self.w.table, 0, idx, out=self.w_host[:n])
@@ -278,6 +328,15 @@ class SsdEngramTable:
                                 torch.empty(n, self.s.row_bytes, dtype=torch.uint8, device="cpu"))
         w_out, s_out = self._pf_scratch
         scales = self.s_res is None
+        if _native():
+            # Nobody waits on a prefetch: the job owns its tensors and is freed when done.
+            pool = _native_pool("prefetch", self.pf_threads)
+            block = _native_block(n, self.pf_threads)
+            if scales:
+                _native().start(pool, self.w.table, idx, w_out, self.s.table, idx, s_out, block, True)
+            else:
+                _native().start(pool, self.w.table, idx, w_out, None, None, None, block, True)
+            return n
         chunk = max(self.min_chunk, -(-n // self.pf_threads))
 
         def work(lo: int) -> None:
