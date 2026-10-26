@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
-# diffbot's recipe/serve/serve.sh, run unchanged, plus the Engram-on-SSD overlay: the four files in overlay/ are bind-mounted
-# over the image's vLLM DeepSeek-V4.1 model code and DSV41_ENGRAM_SSD=1 keeps the int4 Engram tables (~111 GB) in the pack's
-# shards instead of pinned host RAM. Every serve.sh knob still works (API_KEY, PORT, SPEC, SPEC_K, MAX_NUM_SEQS, EAGER, ...).
-#   ENGRAM_SSD=1          0 = stock pinned-RAM path (needs ~230 GiB of host RAM)
-#   ENGRAM_SSD_CHECK=0    1 = every step re-reads a sample of staged rows with pread and compares bit for bit; with EAGER=1
-#                         also compares the prestaged hashes with the stock in-forward hashes. Run this once first.
-#   ENGRAM_SSD_THREADS=128 ENGRAM_SSD_MIN_CHUNK=8   gather threads / smallest rows per task: a cold row is a page fault that
-#                         blocks its thread for ~100 us, so many small tasks keep the SSD queue deep
-#   ENGRAM_SSD_EVICT=1    after load, drop the page cache of the checkpoint outside the Engram tables, which otherwise
-#                         outlives the Engram rows in the cache (overlay/engram_ssd.py docstring)
-#   ENGRAM_SSD_PREFETCH=16384  tokens: hash the prompt tokens later steps will prefill and fault their rows in during this
-#                         step's forward (one chunk ahead; 0 = off); ENGRAM_SSD_PREFETCH_THREADS (default ENGRAM_SSD_THREADS)
-#   ENGRAM_SSD_RESIDENT_SCALES=1  keep the fp16 scales (11.4 GiB total) in host RAM: one SSD read per cold row, not two
-#   CONTAINER_MEM=120g    (stock: 260g). Page cache is charged to the container, so this also caps how much of the Engram
-#                         tables stays cached; on a 128 GB host 120g leaves ~5 GB for the OS.
-#   PACK=<dir>            required: the downloaded pack (its recipe/ is what runs; build its image and kernels first, README)
-#   SSD_PLAN=<file>       host-expert plan from this repo's plans/ instead of the recipe's PLAN (keep HOST_CACHE=512 with the
-#                         c512-pN plans: they are the stock c512 plan with N of its hottest host experts moved back to VRAM)
+# Runs diffbot's recipe/serve/serve.sh unchanged, with overlay/ bind-mounted over the image's vLLM DeepSeek-V4.1 code so the
+# int4 Engram tables stay on SSD. Every serve.sh knob still works (API_KEY, PORT, SPEC, MAX_NUM_SEQS, EAGER, ...). Plus:
+#   PACK=<dir>                    required: diffbot's downloaded pack (build its image and kernels first, see README)
+#   ENGRAM_SSD=1                  0 = diffbot's pinned-RAM path (needs ~230 GiB of RAM)
+#   ENGRAM_SSD_PREFETCH=16384     tokens of the next prefill chunk to read ahead during the current one; 0 = off
+#   ENGRAM_SSD_RESIDENT_SCALES=1  keep the Engram scales (11.4 GiB) in RAM: one SSD read per cold row instead of two
+#   ENGRAM_SSD_EVICT=1            after load, drop the other shards from the page cache so it holds Engram rows
+#   ENGRAM_SSD_THREADS=128        gather threads (a cold row is a page fault that blocks one); ENGRAM_SSD_MIN_CHUNK=8 rows/task
+#   ENGRAM_SSD_CHECK=0            1 = parity mode: re-read sampled rows with pread and compare bit for bit every step
+#   CONTAINER_MEM=120g            container cap (diffbot: 260g); page cache counts against it, so it caps the Engram cache too
+#   SSD_PLAN=<file in plans/>     host-expert plan; default the p375 plan, SSD_PLAN= for diffbot's. Keep HOST_CACHE=512.
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${PACK:?set PACK to the downloaded diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000 directory}"
@@ -35,7 +28,8 @@ if [[ $ENGRAM_SSD == 1 ]]; then
     mounts+=(-v "$O/$(basename $f):$VP/$f:ro")
   done
 fi
-if [[ -n ${SSD_PLAN:-} ]]; then
+SSD_PLAN=${SSD_PLAN-plan-1017-agent30-c512-p375.json}
+if [[ -n $SSD_PLAN ]]; then
   [[ -f $ROOT/plans/$SSD_PLAN ]] || { echo "plans/$SSD_PLAN missing"; exit 1; }
   export EXL3_HOST_EXPERTS=/opt/ssd-plans/$SSD_PLAN
 fi
