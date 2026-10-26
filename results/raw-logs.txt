@@ -1,0 +1,39 @@
+=== bench-fixed-1.log
+decode 1 stream: 2K 80.8 | 46K median 114.9 tok/s (74.5 87.1 97.5 103.9 92.2 112.1 132.1 117.7 133.5 135.7) | decode 4 streams 46K median 218.8 agg (218.8 226.5 211.1) | fresh prefill 1673:972 39962:3872 40266:5908 tok/s
+=== bench-fixed-2.log
+decode 1 stream: 2K 123.1 | 46K median 120.7 tok/s (126.1 120.0 116.4 107.6 117.9 111.4 143.9 123.5 135.3 140.5) | decode 4 streams 46K median 218.9 agg (216.7 222.4 218.9) | fresh prefill 1673:3540 39962:71094 40266:58678 tok/s
+=== ab-round1.log
+inline1k [ENGRAM_SSD_INLINE_ROWS=1024]: decode 1 stream: 2K 76.9 | 46K median 80.7 tok/s (72.2 81.6 70.0 78.1 86.9 76.6 79.5 81.9 99.8 98.9) | decode 4 streams 46K median 95.7 agg (89.9 95.7 99.9) | fresh prefill 1673:2679 39962:55136 40266:54348 tok/s
+mean tokens 22.5: hash+sync p50 25.69 p99 145.67 ms, row gather+stage p50 16.37 p99 91.16 ms, hash checks 0
+mean tokens 22.5: hash+sync p50 20.91 p99 145.70 ms, row gather+stage p50 22.58 p99 98.70 ms, hash checks 0
+t16c64 [ENGRAM_SSD_THREADS=16 ENGRAM_SSD_MIN_CHUNK=64]: decode 1 stream: 2K 117.0 | 46K median 115.3 tok/s (112.2 121.7 98.2 113.3 113.4 114.6 125.3 125.8 141.5 116.0) | decode 4 streams 46K median 216.3 agg (206.8 216.3 228.3) | fresh prefill 1673:3079 39962:60033 40266:56952 tok/s
+mean tokens 22.3: hash+sync p50 20.80 p99 151.35 ms, row gather+stage p50 4.23 p99 15.86 ms, hash checks 0
+mean tokens 22.3: hash+sync p50 19.65 p99 151.34 ms, row gather+stage p50 6.43 p99 17.45 ms, hash checks 0
+=== ab-round2.log
+t128c8m120 [ENGRAM_SSD_THREADS=128 ENGRAM_SSD_MIN_CHUNK=8 CONTAINER_MEM=120g]: decode 1 stream: 2K 132.6 | 46K median 139.7 tok/s (138.2 127.0 130.2 131.7 126.9 117.3 150.7 152.5 156.0 147.7) | decode 4 streams 46K median 227.4 agg (229.5 218.9 227.4) | fresh prefill 1673:3585 39962:60979 40266:56561 tok/s
+mean tokens 23.2: hash+sync p50 21.56 p99 141.35 ms, row gather+stage p50 3.11 p99 17.47 ms, hash checks 0
+mean tokens 23.2: hash+sync p50 21.21 p99 141.38 ms, row gather+stage p50 3.21 p99 17.33 ms, hash checks 0
+t128c8m120p375 [ENGRAM_SSD_THREADS=128 ENGRAM_SSD_MIN_CHUNK=8 CONTAINER_MEM=120g SSD_PLAN=plan-1017-agent30-c512-p375.json]: decode 1 stream: 2K 132.7 | 46K median 132.8 tok/s (129.7 135.7 143.2 130.3 133.6 125.8 125.6 148.3 132.0 155.4) | decode 4 streams 46K median 249.3 agg (239.3 249.3 259.4) | fresh prefill 1673:3321 39962:68918 40266:64489 tok/s
+mean tokens 19.1: hash+sync p50 17.24 p99 130.38 ms, row gather+stage p50 2.85 p99 16.06 ms, hash checks 0
+mean tokens 19.1: hash+sync p50 17.05 p99 130.36 ms, row gather+stage p50 3.04 p99 16.76 ms, hash checks 0
+=== quality-p375.log
+deepseek-v4.1-flash GSM8K first 200: 197/200 = 98.5%  (truncated 0, errors 0, 266s)
+deepseek-v4.1-flash HumanEval 164: 160/164 = 97.6%  (truncated 0, errors 0, 168s)
+wrote logs/quality-p375.jsonl | thinking False
+=== parity run (EAGER=1, ENGRAM_SSD_CHECK=1)
+(Worker_TP1 pid=1013) INFO 10-26 08:34:12 [model.py:150] engram prestage 500 steps, mean tokens 43.4: hash+sync p50 148.78 p99 216.28 ms, row gather+stage p50 26.24 p99 39.88 ms, hash checks 499
+(Worker_TP0 pid=1012) INFO 10-26 08:34:12 [model.py:150] engram prestage 500 steps, mean tokens 43.4: hash+sync p50 147.17 p99 217.42 ms, row gather+stage p50 26.11 p99 39.24 ms, hash checks 499
+=== Engram layer placement
+INFO 10-26 09:16:58 [engram_ssd.py:139] Engram layer 1 on SSD: rows [192001740, 384006168) of model-00047-of-00048.safetensors, 12 local heads, staging 196608 rows (27.0 MiB pinned)
+INFO 10-26 09:16:58 [engram_ssd.py:139] Engram layer 1 on SSD: rows [0, 192001740) of model-00047-of-00048.safetensors, 12 local heads, staging 196608 rows (27.0 MiB pinned)
+INFO 10-26 09:17:01 [engram_ssd.py:139] Engram layer 14 on SSD: rows [192007016, 384016682) of model-00048-of-00048.safetensors, 12 local heads, staging 196608 rows (27.0 MiB pinned)
+INFO 10-26 09:17:01 [engram_ssd.py:139] Engram layer 14 on SSD: rows [0, 192007016) of model-00048-of-00048.safetensors, 12 local heads, staging 196608 rows (27.0 MiB pinned)
+=== memory (memlog.sh), p375 server after needle + evals
+03:06:16 host_avail=47.6G cg_current=118.1G anon=70.4 file=46.7 shmem=0.5 file_mapped=14.0 unevictable=0.0 
+=== ab-nospec.log
+nospec [SPEC=none SSD_PLAN=plan-1017-agent30-c512-p375.json]: decode 1 stream: 2K 84.3 | 46K median 87.3 tok/s (83.9 84.7 85.3 87.3 87.1 87.5 87.4 85.9 91.1 89.3) | decode 4 streams 46K median 205.2 agg (202.0 205.2 207.9) | fresh prefill 1673:3505 39962:66249 40266:59173 tok/s
+mean tokens 7.4: hash+sync p50 13.09 p99 26.04 ms, row gather+stage p50 2.05 p99 3.35 ms, hash checks 0
+mean tokens 7.4: hash+sync p50 13.10 p99 25.87 ms, row gather+stage p50 2.11 p99 3.06 ms, hash checks 0
+=== 1M needle (p375 server, recipe/bench/needle-test.py 64500), VRAM sampled every 2 s with nvidia-smi
+prompt_tokens=1,032,034 | 104.0s (~9,920 tok/s prefill) | found=True | 'PELICAN-42'
+peak MiB 95486 95486 of 97887

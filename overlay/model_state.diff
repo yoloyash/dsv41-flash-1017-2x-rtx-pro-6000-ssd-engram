@@ -1,0 +1,57 @@
+--- overlay/base/model_state.py	2026-10-26 01:35:16.766175684 -0700
++++ overlay/model_state.py	2026-10-26 01:35:07.036536107 -0700
+@@ -400,14 +400,54 @@
+             BLOCK_DEPTH=triton.next_power_of_2(depth),
+         )
+         model_inputs["lookback_token_ids"] = window
++        inner = self._engram_prestage_model()
++        if inner is not None:
++            # DSV41_ENGRAM_SSD: eager pre-step that hashes the padded batch and
++            # stages its Engram rows from SSD before the (possibly graph-replayed)
++            # forward reads them.
++            num_reqs = input_batch.num_reqs_after_padding
++            inner.engram_prestage(
++                input_batch.input_ids,
++                input_batch.positions,
++                input_batch.query_start_loc[: num_reqs + 1],
++                window,
++            )
+         return model_inputs
+ 
++    def _engram_prestage_model(self):
++        """The DeepseekV4Model that owns the engram hash state, behind the
++        ForCausalLM wrapper and, for the VL entry point, language_model."""
++        cached = self.__dict__.get("_prestage_model", False)
++        if cached is not False:
++            return cached
++        obj, found = self.model, None
++        for _ in range(4):
++            if getattr(obj, "engram_prestage_enabled", False):
++                found = obj
++                break
++            nxt = getattr(obj, "language_model", None)
++            if nxt is None:
++                nxt = getattr(obj, "model", None)
++            if nxt is None or nxt is obj:
++                break
++            obj = nxt
++        if found is None and os.environ.get("DSV41_ENGRAM_SSD", "0") == "1":
++            raise RuntimeError(
++                "DSV41_ENGRAM_SSD=1 but no engram-bearing model was found behind "
++                f"{type(self.model).__name__}; the prestage hook would never run"
++            )
++        self._prestage_model = found
++        return found
++
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+         if self.lookback_token_ids is not None:
+             # The captured graph reads this buffer; replays refill it in place.
+             self.lookback_token_ids.fill_(-1)
+             model_inputs["lookback_token_ids"] = self.lookback_token_ids
++        inner = self._engram_prestage_model()
++        if inner is not None:
++            inner.engram_prestage_dummy(num_tokens)
+         return model_inputs
+ 
+     def prepare_attn(

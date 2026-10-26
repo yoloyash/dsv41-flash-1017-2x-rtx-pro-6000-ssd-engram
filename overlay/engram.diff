@@ -1,0 +1,72 @@
+--- overlay/base/engram.py	2026-10-26 01:35:16.765609643 -0700
++++ overlay/engram.py	2026-10-26 01:35:06.965534889 -0700
+@@ -942,6 +942,13 @@
+ # 2026-09-28: DSV41_ENGRAM_INT4=1 serves Engram tables re-encoded by convert_engram_int4.py: packed int4 rows
+ # (nibble = q + 8, two per byte) with fp16 per-32 scales. 144 B/row instead of 264 -> ~45% less pinned host RAM.
+ _ENGRAM_INT4 = os.environ.get("DSV41_ENGRAM_INT4", "0") == "1"
++# DSV41_ENGRAM_SSD=1: the int4 tables stay in the checkpoint shards; rows are staged per step (engram_ssd.py).
++from vllm.models.deepseek_v41.common.engram_ssd import SsdEngramTable, engram_ssd_enabled, install_loader_skip
++_ENGRAM_SSD = engram_ssd_enabled()
++if _ENGRAM_SSD:
++    if not _ENGRAM_INT4:
++        raise RuntimeError("DSV41_ENGRAM_SSD=1 serves int4 Engram tables only: set DSV41_ENGRAM_INT4=1")
++    install_loader_skip()
+ 
+ 
+ @triton.jit
+@@ -1021,6 +1028,8 @@
+         super().__init__()
+         assert head_sizes and all(size > 0 for size in head_sizes)
+         assert sum(head_sizes) <= num_embeddings
++        if _ENGRAM_SSD:
++            cpu_offload = dp_shared_memory = use_thp = False
+         self.cpu_offload = cpu_offload
+         self.dp_shared_memory = dp_shared_memory
+         self.use_thp = use_thp
+@@ -1092,6 +1101,12 @@
+         return self.tp_size * self.dp_size, engram_head_shard_rank()
+ 
+     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
++        if _ENGRAM_SSD:
++            # 1-row placeholders: the table is read from the shards (engram_ssd.py), never loaded.
++            return (
++                torch.zeros(1, self.dim // 2, dtype=torch.uint8),
++                torch.zeros(1, self.dim // self.block_size, dtype=torch.float16),
++            )
+         if getattr(self, "int4", False):
+             # packed int4 rows (dim/2 bytes) + fp16 per-block scales; pinned host memory for UVA reads when offloaded
+             kw = {"device": "cpu", "pin_memory": True} if self.cpu_offload else {}
+@@ -1183,6 +1198,8 @@
+         rows = indices.shape[0] * self.part_n_hash_cols
+         if not rows:
+             return
++        if _ENGRAM_SSD:
++            raise RuntimeError("Engram lookup reached with DSV41_ENGRAM_SSD=1: rows must come from engram_prestage")
+         weight, scales = self._storage()
+         ids_stride_t, ids_stride_h = indices.stride()
+         sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
+@@ -1648,6 +1665,24 @@
+ 
+         max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+         self._init_staging(max_tokens, layout.head_dim)
++        self.ssd_table: SsdEngramTable | None = None
++        if _ENGRAM_SSD:
++            self.ssd_table = SsdEngramTable(
++                self.embed_tokens,
++                layout.layer_ids[layer_hash_index],
++                self.staged_rows.shape[0],
++                self.staged_rows.device,
++            )
++
++    def prestage_start(self, hash_ids: torch.Tensor):
++        """DSV41_ENGRAM_SSD: start reading this step's rows (hash_ids
++        [T, n_hash_cols] on the CPU); prestage_finish stages them into staged_rows."""
++        assert self.ssd_table is not None
++        return self.ssd_table.start(hash_ids)
++
++    def prestage_finish(self, state) -> None:
++        assert self.ssd_table is not None
++        self.ssd_table.finish(state, self.staged_rows)
+ 
+     def _create_embedding(
+         self, layout: EngramLayout, layer_hash_index: int

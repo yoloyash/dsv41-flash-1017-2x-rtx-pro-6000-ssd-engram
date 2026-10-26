@@ -1,0 +1,18 @@
+dsv41-flash-1017-2x-rtx-pro-6000-ssd-engram
+Copyright (c) 2026 Yash Khurana
+
+overlay/engram.py, overlay/model.py and overlay/model_state.py are modified versions of
+vllm/models/deepseek_v41/common/engram.py, nvidia/model.py and nvidia/model_state.py from vLLM
+(https://github.com/vllm-project/vllm, Apache License 2.0), as built into the serving image by
+diffbot's recipe/docker/build.sh (base vllm/vllm-openai:nightly-5555a2d8 plus diffbot's MIT-licensed
+patch series). These three files remain under the Apache License 2.0
+(https://www.apache.org/licenses/LICENSE-2.0).
+
+Modifications (2026-10-26): the int4 Engram row lookup moves out of the CUDA-graphed forward into the
+model runner's eager prepare_inputs step, reading rows from the checkpoint shards on disk
+(DSV41_ENGRAM_SSD=1); an optional parity check; a step timer; hard failures if the stock lookup is
+reached or the staged token count does not match the step. overlay/*.diff list every change against
+the files in the image. The structure of the prepare_inputs hook, the prestage/dummy/parity methods and
+the fail-loud guards follows nktlabs/dsv41-flash-engram-disk-prestage (MIT, see ATTRIBUTIONS.md).
+
+overlay/engram_ssd.py and everything else in this repository is new work under the MIT License (LICENSE).

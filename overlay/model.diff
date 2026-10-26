@@ -1,0 +1,219 @@
+--- overlay/base/model.py	2026-10-26 01:35:16.765884403 -0700
++++ overlay/model.py	2026-10-26 01:35:07.003535540 -0700
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import time
+ import typing
+ from collections.abc import Callable, Iterable
+ from functools import partial
+@@ -107,6 +108,8 @@
+     gather_engram_hashes,
+ )
+ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
++from ..common.engram import DEAD_ID
++from ..common.engram_ssd import engram_ssd_check_enabled, engram_ssd_enabled
+ from .ops.mhc import (
+     MHC_OVERLAP_MAX_TOKENS,
+     init_mhc_all_reduce,
+@@ -122,6 +125,37 @@
+ logger = init_logger(__name__)
+ 
+ 
++class _PrestageStats:
++    """Per-step Engram prestage timing (DSV41_ENGRAM_SSD), logged every
++    DSV41_ENGRAM_SSD_LOG_EVERY steps: what to read when profiling the gap to
++    the pinned-RAM path."""
++
++    def __init__(self) -> None:
++        import os
++
++        self.every = int(os.environ.get("DSV41_ENGRAM_SSD_LOG_EVERY", "500"))
++        self.rows: list[tuple[int, float, float]] = []
++        self.checked = 0
++
++    def record(self, tokens: int, hash_s: float, stage_s: float) -> None:
++        self.rows.append((tokens, hash_s, stage_s))
++        if len(self.rows) < self.every:
++            return
++        import statistics as st
++
++        def ms(i: int, q: float) -> float:
++            vals = sorted(r[i] for r in self.rows)
++            return 1e3 * vals[min(len(vals) - 1, int(q * len(vals)))]
++
++        logger.info(
++            "engram prestage %d steps, mean tokens %.1f: hash+sync p50 %.2f p99 %.2f ms, "
++            "row gather+stage p50 %.2f p99 %.2f ms, hash checks %d",
++            len(self.rows), st.mean(r[0] for r in self.rows), ms(1, .5), ms(1, .99),
++            ms(2, .5), ms(2, .99), self.checked,
++        )
++        self.rows.clear()
++
++
+ class DeepseekV4MoE(DeepseekV4MoEBase):
+     def __init__(
+         self,
+@@ -862,6 +896,34 @@
+                 )
+                 self.engram_swa_prefix = swa_cache_module.prefix
+ 
++        # DSV41_ENGRAM_SSD: the model runner hashes the padded batch and stages its
++        # Engram rows from SSD before the forward (engram_prestage), so the captured
++        # decode graph only reads persistent device buffers. From
++        # nktlabs/dsv41-flash-engram-disk-prestage (MIT).
++        self.engram_prestage_enabled = (
++            engram_ssd_enabled() and self.engram_hash is not None
++        )
++        self.prestaged_hashes: torch.Tensor | None = None
++        self.prestaged_tokens = -1
++        if self.engram_prestage_enabled:
++            assert self.engram_hash is not None
++            if self.engram_hash.use_slot_cache:
++                raise RuntimeError(
++                    "DSV41_ENGRAM_SSD=1 needs the V2 model runner "
++                    "(the V1 slot cache is written inside the forward)"
++                )
++            n_layers, max_ngram = self.engram_hash.multipliers.shape
++            n_heads = self.engram_hash.primes.shape[-1]
++            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
++            self.prestaged_hashes = torch.full(
++                (max_tokens, n_layers, (max_ngram - 1) * n_heads),
++                DEAD_ID,
++                dtype=torch.int32,
++            )
++            self._prestage_dummy_block_table = torch.zeros((1, 1), dtype=torch.int32)
++            self._prestage_dummy_slot_mapping = torch.zeros((1,), dtype=torch.int64)
++            self._prestage_stats = _PrestageStats()
++
+         if get_pp_group().is_last_rank:
+             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
+         else:
+@@ -883,6 +945,95 @@
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
++    def engram_prestage(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        lookback_token_ids: torch.Tensor,
++    ) -> None:
++        """Eager pre-step for DSV41_ENGRAM_SSD=1: hash the (padded) batch, stage
++        every engram layer's rows from SSD into its staged_rows, and record the
++        token count the next forward must match. Called by
++        DeepseekV41ModelState.prepare_inputs before every step."""
++        assert self.engram_hash is not None and self.prestaged_hashes is not None
++        num_tokens = input_ids.shape[0]
++        if num_tokens > self.prestaged_hashes.shape[0]:
++            raise RuntimeError(
++                f"engram prestage: {num_tokens} tokens exceed the hash buffer "
++                f"({self.prestaged_hashes.shape[0]})"
++            )
++        if not self.engram_hash.ensure_cache():
++            self.engram_prestage_dummy(num_tokens)
++            return
++        t0 = time.perf_counter()
++        hashes = self.engram_hash(
++            input_ids,
++            positions,
++            query_start_loc,
++            image_sentinel_mask(input_ids),
++            lookback_token_ids,
++            image_sentinel_mask(lookback_token_ids),
++            self._prestage_dummy_slot_mapping,
++            self._prestage_dummy_block_table,
++        )
++        self.prestaged_hashes[:num_tokens].copy_(hashes)
++        hashes_cpu = hashes.cpu()
++        t1 = time.perf_counter()
++        engrams = [
++            layer.engram
++            for layer in islice(self.layers, self.start_layer, self.end_layer)
++            if getattr(layer, "engram", None) is not None
++        ]
++        states = [e.prestage_start(hashes_cpu[:, e.layer_hash_index]) for e in engrams]
++        for engram, state in zip(engrams, states):
++            engram.prestage_finish(state)
++        t2 = time.perf_counter()
++        self.prestaged_tokens = num_tokens
++        self._prestage_stats.record(num_tokens, t1 - t0, t2 - t1)
++
++    def engram_prestage_dummy(self, num_tokens: int) -> None:
++        """Capture, profile and warmup runs: fixed shapes, no disk reads."""
++        assert self.prestaged_hashes is not None
++        self.prestaged_hashes[:num_tokens].fill_(DEAD_ID)
++        self.prestaged_tokens = num_tokens
++
++    def _check_engram_prestage(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        lookback_token_ids: torch.Tensor | None,
++        prestaged: torch.Tensor,
++    ) -> None:
++        """DSV41_ENGRAM_SSD_CHECK=1, eager forwards: recompute the hashes with the
++        stock in-forward call and raise on any difference from the pre-step's."""
++        assert self.engram_hash is not None and self.engram_swa_prefix is not None
++        if lookback_token_ids is None:
++            raise RuntimeError("engram prestage check needs lookback_token_ids")
++        attn_metadata = get_forward_context().attn_metadata
++        if isinstance(attn_metadata, list):
++            attn_metadata = attn_metadata[dbo_current_ubatch_id()]
++        swa_metadata = typing.cast(
++            "DeepseekSparseSWAMetadata", attn_metadata[self.engram_swa_prefix]
++        )
++        ref = self.engram_hash(
++            input_ids,
++            positions,
++            swa_metadata.query_start_loc,
++            image_sentinel_mask(input_ids),
++            lookback_token_ids,
++            image_sentinel_mask(lookback_token_ids),
++            swa_metadata.slot_mapping,
++            swa_metadata.block_table,
++        )
++        if not torch.equal(ref, prestaged):
++            bad = int((ref != prestaged).any(dim=-1).any(dim=-1).sum())
++            raise RuntimeError(
++                f"engram prestage hash parity failed: {bad} of "
++                f"{input_ids.shape[0]} tokens differ"
++            )
++        self._prestage_stats.checked += 1
++
+     def make_empty_intermediate_tensors(
+         self,
+         batch_size: int,
+@@ -937,6 +1088,31 @@
+         engram_hashes: torch.Tensor | None = None
+         engram_mask: torch.Tensor | None = None
+         if (
++            self.engram_prestage_enabled
++            and input_ids is not None
++            and is_forward_context_available()
++        ):
++            # Rows were staged by the runner before this forward; nothing here
++            # touches the host, so the decode graph can be captured. Fail loudly
++            # rather than run on rows staged for another batch.
++            assert self.engram_hash is not None and self.prestaged_hashes is not None
++            if self.engram_hash.ensure_cache():
++                num_tokens = input_ids.shape[0]
++                if self.prestaged_tokens != num_tokens:
++                    raise RuntimeError(
++                        f"engram prestage covered {self.prestaged_tokens} tokens "
++                        f"but the forward has {num_tokens}"
++                    )
++                engram_hashes = self.prestaged_hashes[:num_tokens]
++                engram_mask = ~image_sentinel_mask(input_ids)
++                if (
++                    engram_ssd_check_enabled()
++                    and not torch.cuda.is_current_stream_capturing()
++                ):
++                    self._check_engram_prestage(
++                        input_ids, positions, lookback_token_ids, engram_hashes
++                    )
++        elif (
+             self.engram_hash is not None
+             and input_ids is not None
+             and is_forward_context_available()
