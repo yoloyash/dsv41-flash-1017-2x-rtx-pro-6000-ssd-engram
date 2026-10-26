@@ -45,8 +45,8 @@ Notes:
   measured in the first minutes after a restart (cold cache), two runs. A server that has been up for a while does better.
 - Right after a boot, decode is slower until the page cache warms up (80.8 / 114.9 / 218.8 on an earlier version).
 - DSpark off: 84.3 / 87.3 / 205.2 tok/s. Leave it on.
-- Quality, the needle and DSpark-off were measured before prefetch / resident scales / eviction / per-layer wait. Those don't
-  change any row the model sees, only speed.
+- Quality, the needle and DSpark-off were measured before prefetch / resident scales / eviction / per-layer wait / native
+  gather. Those don't change any row the model sees, only speed.
 
 ### What each change is worth
 
@@ -151,8 +151,10 @@ Where the remaining gap is:
 
 Tried and dropped: vLLM's adaptive DSpark verification (`enable_adaptive_verification`: it needs a variable-length indexer
 kernel that exists for sm_90 and sm_100 only, so vLLM refuses to start with it on sm_120), an io_uring reader (the SSD tops out
-at ~200K random reads/s, which the threads already reach), prefetching two chunks ahead (same as one), and the per-layer wait
-with both layers read at once (it moves ~0.4 s from the first chunk to the second: no gain).
+at ~200K random reads/s, which the threads already reach), prefetching two chunks ahead (same as one), the per-layer wait
+with both layers read at once (it moves ~0.4 s from the first chunk to the second: no gain), and a short first chunk for new
+prompts (8K, taking the last chunk's place so the step count stays the same: ~140 ms less Engram wait per prompt, but new-text
+prefill did not move and cached-text prefill lost ~1.5%).
 
 ## Fidelity
 

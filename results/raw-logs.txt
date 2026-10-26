@@ -195,3 +195,26 @@ arm 21 native-off-again [ENGRAM_SSD_NATIVE=0]: ARM 21: A new text median 7419 to
   engram prestage 200 steps, mean tokens 30.1: hash+sync p50 32.68 p99 130.45 ms, row gather+stage p50 5.05 p99 15.99 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.36 max 0.36 ms (2 steps), layer 14 deferred wait p50 0.31 max 0.31 ms (2 steps)
   engram prestage 200 steps, mean tokens 38.4: hash+sync p50 34.73 p99 108.30 ms, row gather+stage p50 4.60 p99 14.62 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.33 max 0.38 ms (4 steps), layer 14 deferred wait p50 0.25 max 0.28 ms (4 steps)
   engram prestage 200 steps, mean tokens 38.4: hash+sync p50 33.18 p99 108.33 ms, row gather+stage p50 5.37 p99 15.40 ms, prefetched tokens 0, hash checks 0, layer 1 deferred wait p50 0.35 max 0.44 ms (4 steps), layer 14 deferred wait p50 0.30 max 0.30 ms (4 steps)
+=== short first chunk for new prompts (vLLM scheduler overlay, DSV41_ENGRAM_SSD_FIRST_CHUNK; dropped, not in the repo). Prefill
+only, 8 fresh slices per arm of a second corpus (Python sources from other venvs, minus every file of the first), restart per
+arm, native gather on. Arms 0-1: the first chunk simply capped (adds a step: 8192 + 16380 + 16380 + 74); arms 6-9: the first
+chunk takes the last chunk's place, never more steps than without it (run in the order 6, 7, 8, 9). "exposed Engram wait" =
+prestage gather+stage plus in-forward waits per new-text prompt, rank 0. "SSD cost" = new-text minus cached-text time, same slice.
+arm 0 fc-off [ENGRAM_SSD_FIRST_CHUNK=0]: ARM 0: A new text median 8015 tok/s (mean 7798) | B Engram warm median 9405 tok/s
+arm 1 fc-8k [ENGRAM_SSD_FIRST_CHUNK=8192]: ARM 1: A new text median 7872 tok/s (mean 7750) | B Engram warm median 9259 tok/s
+arm 6 fc-off [ENGRAM_SSD_FIRST_CHUNK=0]: ARM 6: A new text median 7776 tok/s (mean 7872) | B Engram warm median 9512 tok/s
+arm 7 fc-8k [ENGRAM_SSD_FIRST_CHUNK=8192]: ARM 7: A new text median 7998 tok/s (mean 7758) | B Engram warm median 9399 tok/s
+arm 8 fc-8k-again [ENGRAM_SSD_FIRST_CHUNK=8192]: ARM 8: A new text median 7984 tok/s (mean 7846) | B Engram warm median 9256 tok/s
+arm 9 fc-off-again [ENGRAM_SSD_FIRST_CHUNK=0]: ARM 9: A new text median 8123 tok/s (mean 7994) | B Engram warm median 9485 tok/s
+arm 0: chunks of the first prompt 16380 16380 8096; exposed Engram wait per new-text prompt median 515 ms (600 651 552 614 478 302 348 418); chunk 1 median 480 ms; chunk 2 median 6 ms
+arm 1: chunks of the first prompt 8192 16380 16380 74; exposed Engram wait per new-text prompt median 312 ms (795 553 310 280 304 315 401 25); chunk 1 median 245 ms; chunk 2 median 70 ms
+arm 6: chunks of the first prompt 16380 16380 10379; exposed Engram wait per new-text prompt median 466 ms (403 678 803 596 530 400 352 318); chunk 1 median 456 ms; chunk 2 median 6 ms
+arm 7: chunks of the first prompt 8192 16380 14835; exposed Engram wait per new-text prompt median 313 ms (693 314 234 339 382 171 312 231); chunk 1 median 226 ms; chunk 2 median 43 ms
+arm 8: chunks of the first prompt 8192 16380 15923; exposed Engram wait per new-text prompt median 284 ms (376 589 363 175 330 232 238 207); chunk 1 median 226 ms; chunk 2 median 24 ms
+arm 9: chunks of the first prompt 16380 16380 8006; exposed Engram wait per new-text prompt median 428 ms (730 484 668 429 335 427 293 174); chunk 1 median 419 ms; chunk 2 median 6 ms
+arm 0: SSD cost median 0.80s (1.25 1.20 1.18 0.82 0.79 0.49 0.54 0.75); A all-slices 7776 tok/s; B all-slices 9368 tok/s
+arm 1: SSD cost median 0.79s (1.52 1.21 0.78 0.56 0.80 0.72 0.79 0.23); A all-slices 7720 tok/s; B all-slices 9167 tok/s
+arm 6: SSD cost median 1.00s (1.04 1.05 1.49 1.12 0.97 0.72 0.53 0.53); A all-slices 7852 tok/s; B all-slices 9506 tok/s
+arm 7: SSD cost median 0.81s (1.50 1.77 0.84 1.03 0.79 0.47 0.76 0.56); A all-slices 7713 tok/s; B all-slices 9404 tok/s
+arm 8: SSD cost median 0.73s (1.01 1.17 1.04 0.68 0.78 0.65 0.62 0.53); A all-slices 7833 tok/s; B all-slices 9318 tok/s
+arm 9: SSD cost median 0.72s (1.43 1.00 1.27 0.66 0.78 0.64 0.55 0.31); A all-slices 7957 tok/s; B all-slices 9503 tok/s
