@@ -19,9 +19,9 @@ Raw output for every number: [`results/raw-logs.txt`](results/raw-logs.txt).
 
 | | diffbot | this repo |
 |---|---:|---:|
-| 1 stream, 2K prompt | 156.9 | **147.8 – 157.3** |
-| 1 stream, 46K prompt | 172.8 | **156.0 – 156.1** |
-| 4 streams, 46K prompts, aggregate | 362.9 | **269.0 – 269.7** |
+| 1 stream, 2K prompt | 156.9 | **162.7 – 163.3** |
+| 1 stream, 46K prompt | 172.8 | **165.9 – 168.7** |
+| 4 streams, 46K prompts, aggregate | 362.9 | **298.7 – 315.9** |
 
 **Prefill**, tok/s, ~40K-token prompt, nothing in the KV cache
 
@@ -35,9 +35,9 @@ Raw output for every number: [`results/raw-logs.txt`](results/raw-logs.txt).
 | | diffbot | this repo |
 |---|---:|---:|
 | GSM8K-200, thinking off | 98.5% | **98.5%** |
-| HumanEval pass@1, thinking off | 97.0% | **97.6%** |
-| ~1.04M-token needle | found, 110.4 s | **found, 104.0 s** |
-| peak VRAM during it | 96.6 / 97.0 GB | 95.5 / 95.5 GB |
+| HumanEval pass@1, thinking off | 97.0% | **96.3 – 97.6%** |
+| ~1.04M-token needle | found, 110.4 s | **found, 111.0 s** |
+| peak VRAM during it | 96.6 / 97.0 GB | 97.0 / 97.0 GB |
 
 Notes:
 - Decode: two runs (restart per run).
@@ -45,8 +45,13 @@ Notes:
   measured in the first minutes after a restart (cold cache), two runs. A server that has been up for a while does better.
 - Right after a boot, decode is slower until the page cache warms up (80.8 / 114.9 / 218.8 on an earlier version).
 - DSpark off: 84.3 / 87.3 / 205.2 tok/s. Leave it on.
-- Quality, the needle and DSpark-off were measured before prefetch / resident scales / eviction / per-layer wait / native
-  gather. Those don't change any row the model sees, only speed.
+- HumanEval, three runs on one server: 158 / 160 / 159 of 164. The same four problems fail every time, the four the
+  earlier p375 build failed; two more flip between runs (batched greedy decoding is not bit-deterministic).
+- The needle ran after the decode and prefill benchmarks, as in every run below; on a server that has done nothing else it
+  takes ~106 s (any cache size). Also with it in flight: test-image.py and three chats (all OK). Four ~250K-token needles at
+  once, then four chats decoding together: all found, peak 97.0 GB, no errors.
+- DSpark-off was measured before prefetch / resident scales / eviction / per-layer wait / native gather / the 736-slot cache.
+  The first five don't change any row the model sees, only speed.
 
 ### What each change is worth
 
@@ -70,11 +75,18 @@ Decode (1 stream 2K / 1 stream 46K / 4 streams), tok/s:
 | prestage only | 132.7 / 132.8 / 249.3 |
 | + evict + prefetch + resident scales | 150.1 / 143.5 / 249.3 |
 | same, a later session (start / end) | 143.9 / 144.6 / 258.2, 154.1 / 138.6 / 271.3 |
-| **+ native row gather (default)**, same session | **157.3 / 156.1 / 269.0, 147.8 / 156.0 / 269.7** |
+| + native row gather, same session | 157.3 / 156.1 / 269.0, 147.8 / 156.0 / 269.7 |
+| same, a later session (start / end) | 148.1 / 150.8 / 289.0, 148.3 / 152.7 / 258.7 |
+| **+ 736-slot host-expert cache (default)**, same session | **162.7 / 165.9 / 298.7, 163.3 / 168.7 / 315.9** |
 
 The native gather is worth ~+10% on one 46K stream (both runs above both runs without it); at 2K and at four streams the runs
 overlap. It leaves prefill where it was (7,561 / 7,419 without, 7,523 / 8,131 with). The per-layer wait only changes prefill steps
 (512+ tokens, which run outside the CUDA graphs); decode steps take the same path as before.
+
+The bigger cache is worth ~+10% at one stream and ~+12% at four (both runs above both runs without it, in all three columns).
+Cold decode routes served from VRAM go from ~82% to ~87%. Prefill on new text (a different corpus from the prefill table's, so
+the absolute numbers differ): 8,615 / 8,495 without, 8,140 / 8,419 with. That is session drift rather than the cache: another
+config (p557 + 640 slots) measured 8,741 / 8,785 early in the same session and 8,013 late.
 
 ### Test host
 
@@ -83,8 +95,8 @@ on PCIe 4.0 x16, Engram shards on a WD_BLACK SN7100 4 TB (~195K random 4 KiB rea
 
 ## Quick start
 
-Needs 2x RTX PRO 6000 (96 GB, sm_120), an NVIDIA driver with CUDA ≥ 13, Docker with the NVIDIA runtime, ~128 GB RAM and ~330 GB on
-a fast NVMe.
+Needs 2x RTX PRO 6000 (96 GB, sm_120) with nothing else on them (or set `HOST_CACHE=512`), an NVIDIA driver with CUDA ≥ 13,
+Docker with the NVIDIA runtime, ~128 GB RAM and ~330 GB on a fast NVMe.
 
 ```bash
 # 1. diffbot's pack (weights + recipe/), on the NVMe
@@ -118,6 +130,7 @@ Every knob of diffbot's `serve.sh` still works (`PORT`, `SPEC`, `MAX_NUM_SEQS`, 
 | `ENGRAM_SSD_CHECK` | `0` | parity mode |
 | `CONTAINER_MEM` | `120g` | container cap; page cache counts against it, so it is also the Engram cache size |
 | `SSD_PLAN` | `plan-1017-agent30-c512-p375.json` | host-expert plan from `plans/`; empty = diffbot's default |
+| `HOST_CACHE` | `736` | VRAM slots per GPU for copies of host experts (diffbot: 512). `512` if a display or another process uses the cards |
 
 ## How it works
 
@@ -141,7 +154,10 @@ them inside the CUDA graphs. Here:
    step needs a few hundred rows, mostly cached, split into ~50 Python tasks per layer whose interpreter overhead was most of the
    cost: the gather between decode steps (the GPU waits for it) took 2.7-5.5 ms, p99 12-17 ms, at four streams. Now 1.1-2.2 ms,
    p99 ~3.5 ms.
-7. **p375 plan**: diffbot's default plan with its 375 hottest host experts moved back to VRAM (+10% at 4 streams).
+7. **VRAM for host experts**: diffbot's plans leave ~2.5 GB/GPU for another process. With nothing else on the cards, that goes
+   to host experts. The p375 plan moves the 375 hottest host experts of diffbot's default plan back to VRAM (+10% at 4 streams).
+   diffbot's VRAM cache of host experts grows from 512 to 736 slots (+10-12%). Both are settings of diffbot's plugin, with no
+   code change. A 1M-token prompt then peaks at 97.0 of 97.9 GB per card.
 
 Where the remaining gap is:
 - a new prompt still waits ~0.9 s on cold reads: ~0.6 s for layer 1's rows of the first chunk (nothing runs before them),
@@ -154,7 +170,10 @@ kernel that exists for sm_90 and sm_100 only, so vLLM refuses to start with it o
 at ~200K random reads/s, which the threads already reach), prefetching two chunks ahead (same as one), the per-layer wait
 with both layers read at once (it moves ~0.4 s from the first chunk to the second: no gain), and a short first chunk for new
 prompts (8K, taking the last chunk's place so the step count stays the same: ~140 ms less Engram wait per prompt, but new-text
-prefill did not move and cached-text prefill lost ~1.5%).
+prefill did not move and cached-text prefill lost ~1.5%). Also dropped: promoting the rest of the plan's warm band (p557: 182
+more experts, plus 640 slots). It used ~0.6 GB/GPU more than the 736-slot cache and measured the same. Going past ~97.3 GB was
+dropped too.
+At p557 + 704 slots the allocator handed memory back 21 times in one 1M-token prefill, so ~97.3 GB is the edge on these cards.
 
 ## Fidelity
 

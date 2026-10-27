@@ -11,12 +11,15 @@
 #   ENGRAM_SSD_THREADS=128        gather threads (a cold row is a page fault that blocks one); ENGRAM_SSD_MIN_CHUNK=8 rows/task
 #   ENGRAM_SSD_CHECK=0            1 = parity mode: re-read sampled rows with pread and compare bit for bit every step
 #   CONTAINER_MEM=120g            container cap (diffbot: 260g); page cache counts against it, so it caps the Engram cache too
-#   SSD_PLAN=<file in plans/>     host-expert plan; default the p375 plan, SSD_PLAN= for diffbot's. Keep HOST_CACHE=512.
+#   SSD_PLAN=<file in plans/>     host-expert plan; default the p375 plan, SSD_PLAN= for diffbot's
+#   HOST_CACHE=736                VRAM slots per GPU for copies of host experts (diffbot: 512). Sized for cards nothing else
+#                                 uses: with a display or another process on them, HOST_CACHE=512 (~1.4 GiB/GPU less)
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${PACK:?set PACK to the downloaded diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000 directory}"
 export PACK
 export CONTAINER_MEM=${CONTAINER_MEM:-120g}
+export HOST_CACHE=${HOST_CACHE:-736}
 # diffbot's recipe: the copy inside the pack (<pack>/recipe, as downloaded from Hugging Face) unless RECIPE points elsewhere
 RECIPE=${RECIPE:-$PACK/recipe}
 [[ -f $RECIPE/serve/serve.sh ]] || { echo "no serve/serve.sh in RECIPE=$RECIPE"; exit 1; }

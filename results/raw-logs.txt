@@ -218,3 +218,102 @@ arm 6: SSD cost median 1.00s (1.04 1.05 1.49 1.12 0.97 0.72 0.53 0.53); A all-sl
 arm 7: SSD cost median 0.81s (1.50 1.77 0.84 1.03 0.79 0.47 0.76 0.56); A all-slices 7713 tok/s; B all-slices 9404 tok/s
 arm 8: SSD cost median 0.73s (1.01 1.17 1.04 0.68 0.78 0.65 0.62 0.53); A all-slices 7833 tok/s; B all-slices 9318 tok/s
 arm 9: SSD cost median 0.72s (1.43 1.00 1.27 0.66 0.78 0.64 0.55 0.31); A all-slices 7957 tok/s; B all-slices 9503 tok/s
+=== host-expert VRAM: bigger promoted plans and host caches (bench-work/run_vram.sh: restart per arm, nvidia-smi every 0.5 s for the
+    whole arm; mode full = bench-fixed.py warm + measured, prefill_ab.py on the arm's own 8 fresh slices of a 179 MiB Python corpus,
+    then a ~1.03M-token needle (recipe/bench/needle-test.py 64500) and test-image.py; mode mem = needle + image only).
+    p557 = plans/make_promoted_plan.py with N=557: the whole band (4,739 host experts). Peaks are MiB per GPU of 97,887.
+arm 30 p375-c512 []: host cache: 512 VRAM slots (3.16 GiB) | idle MiB 92722 92722 | peak bench 0 0 prefill 0 0 needle 95486 95486 image 95488 95488 of 97887 | errors in log 0
+  needle: prompt_tokens=1,032,034 | 105.8s (~9,757 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 31 p557-c512 [SSD_PLAN=plan-1017-agent30-c512-p557.json]: host cache: 512 VRAM slots (3.16 GiB) | idle MiB 93578 93578 | peak bench 0 0 prefill 0 0 needle 96822 96822 image 96824 96824 of 97887 | errors in log 0
+  needle: prompt_tokens=1,032,034 | 105.8s (~9,759 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 32 p557-c640 [SSD_PLAN=plan-1017-agent30-c512-p557.json HOST_CACHE=640]: host cache: 640 VRAM slots (3.96 GiB) | idle MiB 94758 94758 | peak bench 0 0 prefill 0 0 needle 97142 97142 image 97124 97124 of 97887 | errors in log 0
+  needle: prompt_tokens=1,032,034 | 106.0s (~9,732 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+--- full A/B, run in this order
+arm 33 p375-c512 []: host cache: 512 VRAM slots (3.16 GiB) | idle MiB 92720 92720 | peak bench 95286 95286 prefill 95286 95286 needle 95486 95486 image 95486 95486 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 148.1 | 46K median 150.8 tok/s (144.0 152.2 155.0 143.8 148.9 161.1 142.3 145.5 152.7 173.7) | decode 4 streams 46K median 289.0 agg (276.0 294.0 289.0)
+  prefill: ARM 33: A new text median 8615 tok/s (mean 8532) | B Engram warm median 9702 tok/s
+  needle: prompt_tokens=1,032,034 | 111.3s (~9,276 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 34 p557-c512 [SSD_PLAN=plan-1017-agent30-c512-p557.json]: host cache: 512 VRAM slots (3.16 GiB) | idle MiB 93578 93576 | peak bench 95862 95862 prefill 95862 95862 needle 96822 96822 image 96824 96822 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 161.3 | 46K median 161.6 tok/s (152.9 169.7 144.5 130.8 165.5 167.5 168.3 157.7 175.5 142.3) | decode 4 streams 46K median 277.7 agg (277.7 271.0 286.9)
+  prefill: ARM 34: A new text median 8517 tok/s (mean 8598) | B Engram warm median 9977 tok/s
+  needle: prompt_tokens=1,032,034 | 110.8s (~9,319 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 35 p557-c640 [SSD_PLAN=plan-1017-agent30-c512-p557.json HOST_CACHE=640]: host cache: 640 VRAM slots (3.96 GiB) | idle MiB 94758 94758 | peak bench 97102 97102 prefill 97102 97102 needle 97142 97142 image 97124 97124 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 165.7 | 46K median 166.3 tok/s (151.8 179.6 154.3 168.7 179.2 146.1 172.2 173.4 159.1 164.0) | decode 4 streams 46K median 321.2 agg (321.2 323.8 313.3)
+  prefill: ARM 35: A new text median 8741 tok/s (mean 8609) | B Engram warm median 10119 tok/s
+  needle: prompt_tokens=1,032,034 | 110.7s (~9,322 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 36 p557-c640-again [SSD_PLAN=plan-1017-agent30-c512-p557.json HOST_CACHE=640]: host cache: 640 VRAM slots (3.96 GiB) | idle MiB 94756 94758 | peak bench 97102 97102 prefill 97102 97102 needle 97142 97142 image 97122 97124 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 164.3 | 46K median 168.6 tok/s (156.6 172.0 157.8 171.7 186.1 184.2 163.1 166.6 158.9 170.7) | decode 4 streams 46K median 307.2 agg (300.6 316.5 307.2)
+  prefill: ARM 36: A new text median 8785 tok/s (mean 8776) | B Engram warm median 9996 tok/s
+  needle: prompt_tokens=1,032,034 | 111.5s (~9,255 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 37 p557-c512-again [SSD_PLAN=plan-1017-agent30-c512-p557.json]: host cache: 512 VRAM slots (3.16 GiB) | idle MiB 93578 93578 | peak bench 95862 95862 prefill 95862 95862 needle 96824 96822 image 96824 96824 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 152.4 | 46K median 157.7 tok/s (150.7 154.1 144.3 148.4 144.1 163.9 167.3 170.4 170.8 151.4) | decode 4 streams 46K median 297.9 agg (297.9 312.7 274.7)
+  prefill: ARM 37: A new text median 8684 tok/s (mean 8713) | B Engram warm median 9966 tok/s
+  needle: prompt_tokens=1,032,034 | 111.0s (~9,298 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 38 p375-c512-again []: host cache: 512 VRAM slots (3.16 GiB) | idle MiB 92720 92720 | peak bench 95286 95286 prefill 95286 95286 needle 95486 95486 image 95486 95486 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 148.3 | 46K median 152.7 tok/s (146.0 150.6 140.7 146.5 135.3 155.9 149.5 169.0 159.9 170.2) | decode 4 streams 46K median 258.7 agg (252.8 260.8 258.7)
+  prefill: ARM 38: A new text median 8495 tok/s (mean 8534) | B Engram warm median 9847 tok/s
+  needle: prompt_tokens=1,032,034 | 111.0s (~9,296 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+--- round 2, run in this order
+arm 39 p375-c736 [HOST_CACHE=736]: host cache: 736 VRAM slots (4.55 GiB) | idle MiB 94160 94162 | peak bench 96926 96926 prefill 96926 96926 needle 96966 96966 image 96926 96928 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 162.7 | 46K median 165.9 tok/s (170.3 155.1 148.0 150.9 152.5 179.2 182.9 151.4 198.8 189.7) | decode 4 streams 46K median 298.7 agg (298.7 297.9 319.9)
+  prefill: ARM 39: A new text median 8140 tok/s (mean 8220) | B Engram warm median 10196 tok/s
+  needle: prompt_tokens=1,032,034 | 111.0s (~9,298 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 40 p557-c640-third [SSD_PLAN=plan-1017-agent30-c512-p557.json HOST_CACHE=640]: host cache: 640 VRAM slots (3.96 GiB) | idle MiB 94756 94758 | peak bench 97102 97102 prefill 97102 97102 needle 97142 97142 image 97122 97124 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 168.9 | 46K median 159.4 tok/s (156.6 181.2 153.9 153.6 146.2 143.1 164.9 186.8 187.6 167.4) | decode 4 streams 46K median 315.6 agg (315.6 326.0 311.0)
+  prefill: ARM 40: A new text median 8013 tok/s (mean 8135) | B Engram warm median 10150 tok/s
+  needle: prompt_tokens=1,032,034 | 110.3s (~9,355 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 41 p375-c736-again [HOST_CACHE=736]: host cache: 736 VRAM slots (4.55 GiB) | idle MiB 94162 94162 | peak bench 96926 96928 prefill 96928 96930 needle 96966 96968 image 96928 96928 of 97887 | errors in log 0
+  decode: decode 1 stream: 2K 163.3 | 46K median 168.7 tok/s (170.1 156.4 170.1 160.6 186.9 158.7 170.0 169.8 164.3 167.6) | decode 4 streams 46K median 315.9 agg (288.3 315.9 320.2)
+  prefill: ARM 41: A new text median 8419 tok/s (mean 8207) | B Engram warm median 10008 tok/s
+  needle: prompt_tokens=1,032,034 | 111.0s (~9,297 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+arm 42 p557-c704-edge [SSD_PLAN=plan-1017-agent30-c512-p557.json HOST_CACHE=704]: host cache: 704 VRAM slots (4.35 GiB) | idle MiB 94838 94838 | peak bench 0 0 prefill 0 0 needle 97340 97340 image 96884 96882 of 97887 | errors in log 0
+  needle: prompt_tokens=1,032,034 | 106.1s (~9,724 tok/s prefill) | found=True | 'PELICAN-42' | image: IMAGE OK
+--- cold decode routes served from VRAM (host cache log, rank 0, every 50 rebalances)
+arm 33: 52.2% 81.5% 81.8% 82.6% 81.3% 
+arm 34: 54.7% 81.9% 83.2% 84.3% 
+arm 35: 53.0% 84.7% 85.6% 87.5% 86.7% 
+arm 36: 53.2% 84.4% 85.8% 86.7% 
+arm 37: 53.5% 80.9% 83.5% 84.6% 
+arm 38: 53.0% 80.0% 82.2% 83.0% 
+arm 39: 52.3% 83.6% 86.9% 87.7% 
+arm 40: 54.2% 84.8% 86.7% 88.4% 86.0% 
+arm 41: 51.3% 83.3% 87.6% 88.1% 
+--- allocator releases (a sample >50 MiB below the previous one), by phase; the needle runs after the prefill mark
+arm 30: 0 
+arm 31: 0 
+arm 32: 3 prefill:97142->96538 prefill:97022->96898 prefill:97082->96276 
+arm 33: 0 
+arm 34: 0 
+arm 35: 3 prefill:97142->96156 prefill:97022->96898 prefill:97082->96278 
+arm 36: 3 prefill:97142->96156 prefill:97022->96898 prefill:97082->96278 
+arm 37: 0 
+arm 38: 0 
+arm 39: 1 prefill:96966->96082 
+arm 40: 3 prefill:97142->96156 prefill:97022->96898 prefill:97082->96278 
+arm 41: 1 prefill:96966->95560 
+arm 42: 21 prefill:97262->96198 prefill:97042->96338 prefill:97262->96818 prefill:97322->96976 prefill:97218->96496 prefill:97278->96916 prefill:97262->97098 prefill:97158->96516 prefill:97102->96838 prefill:97198->97118 prefill:97118->96796 prefill:97158->96936 prefill:97182->96576 prefill:97198->96778 prefill:97338->94570 prefill:97340->96638 prefill:96978->96878 prefill:97158->96918 prefill:97238->96678 prefill:97302->97118 prefill:97218->96858 
+=== stress on the new default (p375 plan, HOST_CACHE=736; bench-work/stress.py): mix = a ~1.03M-token needle, and 30 s into its
+    prefill test-image.py + 3 chats (2.9K-token prompts, 256 out); quad = four ~250K-token needles at once, then 4 chats together
+arm 50 p375-c736-default [] mix: peak MiB 96966 96966 of 97887, allocator releases 1 | STRESS mix OK
+    needle-1M: 1032056 in / 7 out, 107.1s, 'PELICAN-42'
+    chat1: 2912 in / 29 out, 78.5s, 'The quarterly report repeatedly discusse'
+    image: IMAGE OK rc=0
+    chat0: 2914 in / 119 out, 86.1s, 'The quarterly report repeatedly emphasiz'
+    chat2: 2911 in / 124 out, 86.1s, 'The quarterly report repeatedly emphasiz'
+arm 50 p375-c736-default [] quad: peak MiB 96964 96964 of 97887, allocator releases 0 | STRESS quad OK
+    needle-250K-0: 249654 in / 5 out, 26.2s, 'HERON-00'
+    needle-250K-1: 249651 in / 5 out, 46.7s, 'HERON-11'
+    needle-250K-3: 249653 in / 5 out, 70.3s, 'HERON-33'
+    needle-250K-2: 249652 in / 5 out, 89.6s, 'HERON-22'
+    chat3: 2916 in / 29 out, 2.5s, 'The quarterly report repeatedly discusse'
+    chat1: 2910 in / 32 out, 2.7s, 'The quarterly report repeatedly emphasiz'
+    chat2: 2913 in / 36 out, 3.2s, 'The quarterly report repeatedly emphasiz'
+    chat0: 2916 in / 92 out, 4.2s, 'The quarterly report repeatedly emphasiz'
+  errors in log: 0
+=== quality on the new default (production, HOST_CACHE=736), recipe/bench/quality-probe.py
+deepseek-v4.1-flash GSM8K first 200: 197/200 = 98.5%  (truncated 0, errors 0, 262s)
+deepseek-v4.1-flash HumanEval 164: 158/164 = 96.3%  (truncated 0, errors 0, 141s)
+quality-p375.jsonl: HumanEval 160/164, fails ['HumanEval/132', 'HumanEval/140', 'HumanEval/145', 'HumanEval/83']
+quality-c736.jsonl: HumanEval 158/164, fails ['HumanEval/103', 'HumanEval/132', 'HumanEval/140', 'HumanEval/145', 'HumanEval/32', 'HumanEval/83']
+quality-c736-he2.jsonl: HumanEval 160/164, fails ['HumanEval/132', 'HumanEval/140', 'HumanEval/145', 'HumanEval/83']
+quality-c736-he3.jsonl: HumanEval 159/164, fails ['HumanEval/132', 'HumanEval/140', 'HumanEval/145', 'HumanEval/32', 'HumanEval/83']
