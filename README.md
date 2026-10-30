@@ -186,6 +186,22 @@ At p557 + 704 slots the allocator handed memory back 21 times in one 1M-token pr
   The bit-identity test passes with the native gather on and off.
 - GSM8K / HumanEval match diffbot's figures. Fidelity to the original weights is diffbot's (their `recipe/kl/`).
 
+## Native gather pool regression
+
+The CPU-only stress test exercises detached jobs whose Python tensor owners
+are dropped while the native pool finishes them. It also checks awaited gathers
+against exact reference bytes. No GPU or checkpoint is needed; PyTorch and a
+C++ compiler are required. Run it in a separate process with a timeout, because
+a GIL/pool-mutex deadlock in the original implementation can hang the process:
+
+```bash
+MAX_JOBS=1 timeout 90s python3 tests/test_engram_pool.py overlay/engram_gather.cpp
+```
+
+The timeout includes extension compilation; increase it on slower build hosts.
+This exercises a scheduling-dependent race rather than guaranteeing every
+unpatched run will hang. The GPU row-parity test remains separate.
+
 ## Files
 
 ```
