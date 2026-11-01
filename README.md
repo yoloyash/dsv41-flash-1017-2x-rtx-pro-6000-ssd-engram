@@ -133,6 +133,22 @@ Every knob of diffbot's `serve.sh` still works (`PORT`, `SPEC`, `MAX_NUM_SEQS`, 
 | `HOST_CACHE` | `736` | VRAM slots per GPU for copies of host experts (diffbot: 512). `512` if a display or another process uses the cards |
 | `CACHE_METRICS` | `1` | report `usage.prompt_tokens_details.cached_tokens` in API responses; `0` = off |
 
+### Keep it running
+
+`serve-ssd.sh` runs in the foreground and its container is removed when it stops. To have the server come back after a reboot or a
+crash, install it as a systemd service (optional: it holds both GPUs and up to `CONTAINER_MEM` of RAM from every boot):
+
+```bash
+sudo serve/install-service.sh API_KEY=change-me PACK=/models/dsv41-1017   # plus any setting above, e.g. HOST_CACHE=512
+journalctl -fu dsv41-flash                                                # ready at "[warmup] done"
+sudo systemctl stop dsv41-flash                                           # frees the GPUs until the next boot
+sudo serve/install-service.sh --remove
+```
+
+Settings live in `/etc/dsv41-flash.env` (root only). It restarts after a crash, not after you stop it, and gives up after three
+failed starts in an hour. Not `docker --restart unless-stopped`: diffbot's `serve.sh` runs the container with `--rm`, and its warmup
+runs next to the container, so Docker alone would bring the server back cold.
+
 ## How it works
 
 DeepSeek-V4.1 looks up 48 hashed rows per token in two ~384M-row Engram tables. diffbot pins them in host RAM and the GPU reads

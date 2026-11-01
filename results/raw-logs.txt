@@ -325,3 +325,10 @@ same ~21K-token text three times; last message differs on the third
 2 21160 {'cached_tokens': 21120, 'created_cache_tokens': 0, 'multimodal_tokens': None}
 bench-fixed.py, second pass (a reporting flag: not an A/B, this only shows decode stays in range)
 decode 1 stream: 2K 171.6 | 46K median 167.4 tok/s (165.3 177.9 147.4 168.5 176.9 156.6 166.3 156.1 191.3 194.5) | decode 4 streams 46K median 314.8 agg (295.7 314.8 322.0)
+
+=== serve/install-service.sh, 2026-11-01 (service output via journalctl -u dsv41-flash)
+systemctl stop: 9 s, inactive (Result=success, exit 130), no containers, GPUs back to 2 MiB, still stopped 40 s later
+docker kill: exit 137, "Scheduled restart job, restart counter is at 1" 30 s later, [warmup] done, chat answered
+systemctl reboot: boot id f7d527a2 -> a5e45ec5, service active 13:33:37, [warmup] done 13:38:13, chat answered, NRestarts=0
+refused with rc=1: not root / no API_KEY / bad PACK / quote in a value / no SUDO_USER
+--remove: unit and env file gone, no containers, GPUs back to 2 MiB; install again: enabled, env file 600 root, chat answered
