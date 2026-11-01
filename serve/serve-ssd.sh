@@ -14,12 +14,14 @@
 #   SSD_PLAN=<file in plans/>     host-expert plan; default the p375 plan, SSD_PLAN= for diffbot's
 #   HOST_CACHE=736                VRAM slots per GPU for copies of host experts (diffbot: 512). Sized for cards nothing else
 #                                 uses: with a display or another process on them, HOST_CACHE=512 (~1.4 GiB/GPU less)
+#   CACHE_METRICS=1               report usage.prompt_tokens_details.cached_tokens in API responses; 0 = off
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${PACK:?set PACK to the downloaded diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000 directory}"
 export PACK
 export CONTAINER_MEM=${CONTAINER_MEM:-120g}
 export HOST_CACHE=${HOST_CACHE:-736}
+[[ ${CACHE_METRICS:-1} == 1 ]] && export EXTRA_ARGS="--enable-prompt-tokens-details ${EXTRA_ARGS:-}"
 # diffbot's recipe: the copy inside the pack (<pack>/recipe, as downloaded from Hugging Face) unless RECIPE points elsewhere
 RECIPE=${RECIPE:-$PACK/recipe}
 [[ -f $RECIPE/serve/serve.sh ]] || { echo "no serve/serve.sh in RECIPE=$RECIPE"; exit 1; }

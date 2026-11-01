@@ -317,3 +317,11 @@ quality-p375.jsonl: HumanEval 160/164, fails ['HumanEval/132', 'HumanEval/140', 
 quality-c736.jsonl: HumanEval 158/164, fails ['HumanEval/103', 'HumanEval/132', 'HumanEval/140', 'HumanEval/145', 'HumanEval/32', 'HumanEval/83']
 quality-c736-he2.jsonl: HumanEval 160/164, fails ['HumanEval/132', 'HumanEval/140', 'HumanEval/145', 'HumanEval/83']
 quality-c736-he3.jsonl: HumanEval 159/164, fails ['HumanEval/132', 'HumanEval/140', 'HumanEval/145', 'HumanEval/32', 'HumanEval/83']
+
+=== cache metrics on (CACHE_METRICS=1, --enable-prompt-tokens-details), 2026-11-01; driver 595.99.02, CUDA 13.2, GPUs capped at 450 W
+same ~21K-token text three times; last message differs on the third
+0 21160 {'cached_tokens': 0, 'created_cache_tokens': 21120, 'multimodal_tokens': None}
+1 21160 {'cached_tokens': 21120, 'created_cache_tokens': 0, 'multimodal_tokens': None}
+2 21160 {'cached_tokens': 21120, 'created_cache_tokens': 0, 'multimodal_tokens': None}
+bench-fixed.py, second pass (a reporting flag: not an A/B, this only shows decode stays in range)
+decode 1 stream: 2K 171.6 | 46K median 167.4 tok/s (165.3 177.9 147.4 168.5 176.9 156.6 166.3 156.1 191.3 194.5) | decode 4 streams 46K median 314.8 agg (295.7 314.8 322.0)

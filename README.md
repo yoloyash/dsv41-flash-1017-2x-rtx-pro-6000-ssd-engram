@@ -131,6 +131,7 @@ Every knob of diffbot's `serve.sh` still works (`PORT`, `SPEC`, `MAX_NUM_SEQS`, 
 | `CONTAINER_MEM` | `120g` | container cap; page cache counts against it, so it is also the Engram cache size |
 | `SSD_PLAN` | `plan-1017-agent30-c512-p375.json` | host-expert plan from `plans/`; empty = diffbot's default |
 | `HOST_CACHE` | `736` | VRAM slots per GPU for copies of host experts (diffbot: 512). `512` if a display or another process uses the cards |
+| `CACHE_METRICS` | `1` | report `usage.prompt_tokens_details.cached_tokens` in API responses; `0` = off |
 
 ## How it works
 
