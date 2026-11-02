@@ -45,6 +45,9 @@ def main():
             print(f'jobs={i}', flush=True)
     print(f'PASS {args.jobs} detached jobs plus exact-byte awaited gathers '
           f'in {time.monotonic() - begin:.3f}s', flush=True)
+    # Workers are still freeing the last detached jobs. A tensor freed during interpreter
+    # shutdown aborts the process ("terminate called without an active exception").
+    time.sleep(3)
 
 
 if __name__ == '__main__':

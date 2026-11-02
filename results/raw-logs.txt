@@ -332,3 +332,103 @@ docker kill: exit 137, "Scheduled restart job, restart counter is at 1" 30 s lat
 systemctl reboot: boot id f7d527a2 -> a5e45ec5, service active 13:33:37, [warmup] done 13:38:13, chat answered, NRestarts=0
 refused with rc=1: not root / no API_KEY / bad PACK / quote in a value / no SUDO_USER
 --remove: unit and env file gone, no containers, GPUs back to 2 MiB; install again: enabled, env file 600 root, chat answered
+
+=== PR #1 (mtb-ninja): GIL/pool-mutex deadlock in overlay/engram_gather.cpp, verified 2026-11-01; driver 595.99.02, CUDA 13.2, GPUs capped at 450 W
+tests/test_engram_pool.py in throwaway containers, CPU only, MAX_JOBS=1, SIGKILL at the timeout:
+  original: 10,000 jobs hung 5/5 (60 s), 30 jobs hung 6/6 (90 s); stuck run: 40 threads asleep on futex, main thread in mod.start
+  PR as submitted: PASS in ~5.4 s, 10,000 jobs aborted at exit 6/6 (rc 134, terminate called without an active exception), 30 jobs 4/6
+  PR + a 3 s wait before exit: clean 3/3 at 10,000 jobs
+  merged, with the 3 s wait in the test: clean 5/5 at 10,000 jobs, 6/6 at 30 (rc 0, no terminate)
+--- patched: tests/test_engram_ssd.py, layer/rows/rank
+--- layer/rows/rank 1 384006168 0
+T=    1 rows=    12 total   835.74 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   125.08 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   119.81 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   240.11 ms  bit-identical to stock kernel: True
+OK
+--- layer/rows/rank 1 384006168 1
+T=    1 rows=    12 total   784.74 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   124.78 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   134.23 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   274.79 ms  bit-identical to stock kernel: True
+OK
+--- layer/rows/rank 14 384016682 0
+T=    1 rows=    12 total   787.91 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   126.23 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   122.35 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   123.03 ms  bit-identical to stock kernel: True
+OK
+--- layer/rows/rank 14 384016682 1
+T=    1 rows=    12 total   792.14 ms  bit-identical to stock kernel: True
+T=    6 rows=    72 total   132.94 ms  bit-identical to stock kernel: True
+T=   48 rows=   576 total   138.28 ms  bit-identical to stock kernel: True
+T= 4096 rows= 49152 total   121.03 ms  bit-identical to stock kernel: True
+OK
+--- tests/bench_gather.py, order A B B A; the cold column falls run after run in both versions (page cache filling), so only warm compares
+--- main seed 11
+T=    6 rows/layer=    72  2 layers: random/cold p50     2.16 ms   warm p50     0.61 ms
+T=   48 rows/layer=   576  2 layers: random/cold p50    15.66 ms   warm p50     0.69 ms
+T= 2048 rows/layer= 24576  2 layers: random/cold p50   519.66 ms   warm p50     2.51 ms
+T=16384 rows/layer=196608  2 layers: random/cold p50  2606.81 ms   warm p50    13.53 ms
+--- patched seed 12
+T=    6 rows/layer=    72  2 layers: random/cold p50     1.91 ms   warm p50     0.59 ms
+T=   48 rows/layer=   576  2 layers: random/cold p50    11.83 ms   warm p50     0.68 ms
+T= 2048 rows/layer= 24576  2 layers: random/cold p50   432.69 ms   warm p50     1.71 ms
+T=16384 rows/layer=196608  2 layers: random/cold p50  2017.38 ms   warm p50    11.79 ms
+--- patched seed 13
+T=    6 rows/layer=    72  2 layers: random/cold p50     1.46 ms   warm p50     0.62 ms
+T=   48 rows/layer=   576  2 layers: random/cold p50     9.51 ms   warm p50     0.68 ms
+T= 2048 rows/layer= 24576  2 layers: random/cold p50   362.23 ms   warm p50     1.39 ms
+T=16384 rows/layer=196608  2 layers: random/cold p50  1683.64 ms   warm p50     9.27 ms
+--- main seed 14
+T=    6 rows/layer=    72  2 layers: random/cold p50     1.37 ms   warm p50     0.60 ms
+T=   48 rows/layer=   576  2 layers: random/cold p50     8.09 ms   warm p50     0.67 ms
+T= 2048 rows/layer= 24576  2 layers: random/cold p50   302.31 ms   warm p50     1.81 ms
+T=16384 rows/layer=196608  2 layers: random/cold p50  1433.36 ms   warm p50    10.77 ms
+--- real model, original (one fresh restart)
+--- bench-fixed measured
+decode 1 stream: 2K 163.2 | 46K median 166.0 tok/s (177.0 149.4 153.8 184.9 177.6 165.7 153.7 166.4 184.6 159.3) | decode 4 streams 46K median 314.9 agg (297.6 314.9 318.5) | fresh prefill 1673:4852 39962:85293 40266:76595 tok/s
+--- prefill_ab
+  slice 800: A 46321 tok 8.09s 5726 tok/s | B 46342 tok 4.35s 10663 tok/s | SSD cost +3.74s
+  slice 801: A 45240 tok 7.52s 6018 tok/s | B 45261 tok 4.33s 10462 tok/s | SSD cost +3.19s
+  slice 802: A 46545 tok 7.08s 6571 tok/s | B 46566 tok 4.38s 10634 tok/s | SSD cost +2.70s
+  slice 803: A 46774 tok 6.65s 7032 tok/s | B 46789 tok 4.38s 10690 tok/s | SSD cost +2.27s
+  slice 804: A 49491 tok 7.64s 6482 tok/s | B 49513 tok 4.97s 9969 tok/s | SSD cost +2.67s
+  slice 805: A 48818 tok 5.62s 8691 tok/s | B 48839 tok 4.55s 10737 tok/s | SSD cost +1.07s
+  slice 806: A 46857 tok 6.44s 7273 tok/s | B 46880 tok 4.44s 10549 tok/s | SSD cost +2.00s
+  slice 807: A 46381 tok 6.52s 7109 tok/s | B 46402 tok 4.40s 10538 tok/s | SSD cost +2.12s
+ARM 100: A new text median 6802 tok/s (mean 6863) | B Engram warm median 10592 tok/s
+--- probes
+OK 78 requests, seq32K median 7451 tok/s
+--- needle 1M
+prompt_tokens=1,032,034 | 111.0s (~9,298 tok/s prefill) | found=True | 'PELICAN-42'
+NEEDLE OK
+--- image
+IMAGE OK
+--- engine errors: 0
+--- real model, patched (one fresh restart)
+--- bench-fixed measured
+decode 1 stream: 2K 163.1 | 46K median 169.5 tok/s (164.3 161.9 142.2 172.0 152.7 167.4 197.9 152.3 171.6 179.7) | decode 4 streams 46K median 332.7 agg (318.0 338.0 332.7) | fresh prefill 1673:4336 39962:84706 40266:76362 tok/s
+--- prefill_ab
+  slice 808: A 55775 tok 9.18s 6076 tok/s | B 55797 tok 5.39s 10355 tok/s | SSD cost +3.79s
+  slice 809: A 51189 tok 8.29s 6173 tok/s | B 51209 tok 5.15s 9935 tok/s | SSD cost +3.14s
+  slice 810: A 47291 tok 7.21s 6555 tok/s | B 47313 tok 4.48s 10553 tok/s | SSD cost +2.73s
+  slice 811: A 46221 tok 6.84s 6759 tok/s | B 46237 tok 4.41s 10477 tok/s | SSD cost +2.42s
+  slice 812: A 43709 tok 5.77s 7577 tok/s | B 43728 tok 4.14s 10568 tok/s | SSD cost +1.63s
+  slice 813: A 46234 tok 6.60s 7005 tok/s | B 46254 tok 4.38s 10555 tok/s | SSD cost +2.22s
+  slice 814: A 42349 tok 5.89s 7187 tok/s | B 42372 tok 4.14s 10235 tok/s | SSD cost +1.75s
+  slice 815: A 48176 tok 5.73s 8401 tok/s | B 48197 tok 4.50s 10709 tok/s | SSD cost +1.23s
+ARM 101: A new text median 6882 tok/s (mean 6967) | B Engram warm median 10515 tok/s
+--- probes
+OK 78 requests, seq32K median 7315 tok/s
+--- needle 1M
+prompt_tokens=1,032,034 | 110.9s (~9,310 tok/s prefill) | found=True | 'PELICAN-42'
+NEEDLE OK
+--- image
+IMAGE OK
+--- engine errors: 0
+probes.py: 18 prefills at 8K/32K/128K with 1 and 64 tokens out, 40 sequential 32K, 5 rounds of 4 concurrent 32K; 300 s per-request timeout, none hit
+--- parity on patched (EAGER=1 ENGRAM_SSD_CHECK=1): 47.6K prompt, 4 prompts at once (24.3K/25.7K/25.5K/25.2K), 4 decode streams
+parity rc=0 stat lines=8 tracebacks=0 differ=0 native row gather ready (0.0 s)
+  engram prestage 50 steps, mean tokens 23.4: hash+sync p50 37.44 p99 63.67 ms, row gather+stage p50 18.40 p99 23.80 ms, prefetched tokens 0, hash checks 199
+  engram prestage 50 steps, mean tokens 23.4: hash+sync p50 33.35 p99 61.01 ms, row gather+stage p50 20.02 p99 24.98 ms, prefetched tokens 0, hash checks 199

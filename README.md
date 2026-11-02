@@ -219,6 +219,11 @@ The timeout includes extension compilation; increase it on slower build hosts.
 This exercises a scheduling-dependent race rather than guaranteeing every
 unpatched run will hang. The GPU row-parity test remains separate.
 
+On the box behind this README the original code hung in every run of this test (5/5 at 10,000 jobs, 6/6 at 30). The real model
+did not hang there: 78 fresh prefills at 8K-128K (concurrent ones included) and a 1M-token needle finished before and after the
+fix, so the race is rarer in serving than in this test. A hang would leave the service up and silent, though. With the fix, decode
+and prefill are unchanged within noise, and parity mode and the bit-identity test pass ([`results/raw-logs.txt`](results/raw-logs.txt)).
+
 ## Files
 
 ```
