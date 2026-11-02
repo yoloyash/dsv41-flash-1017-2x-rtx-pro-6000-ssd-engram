@@ -93,11 +93,12 @@ class Pool {
       std::shared_ptr<Job> job;
       {
         std::unique_lock<std::mutex> l(mu_);
-        cv_.wait(l, [&] {
-          while (!queue_.empty() && queue_.front()->next.load() >= queue_.front()->blocks) queue_.pop_front();
-          return !queue_.empty();
-        });
+        cv_.wait(l, [&] { return !queue_.empty(); });
+        // Keep a local owner before retiring the queue entry. A Job owns Torch
+        // tensors whose final destruction can acquire Python's GIL. Destroying
+        // it under mu_ deadlocks against a Python caller submitting a new job.
         job = queue_.front();
+        if (job->next.load() >= job->blocks) queue_.pop_front();
       }
       job->work();
     }
@@ -170,7 +171,8 @@ void wait(int64_t handle, int64_t job) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("new_pool", &new_pool);
-  m.def("start", &start);
+  m.def("new_pool", &new_pool, pybind11::call_guard<pybind11::gil_scoped_release>());
+  // Native submission may block on the pool mutex. Never hold the GIL there.
+  m.def("start", &start, pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("wait", &wait);
 }
