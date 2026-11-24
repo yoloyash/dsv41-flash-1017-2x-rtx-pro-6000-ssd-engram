@@ -149,6 +149,42 @@ Settings live in `/etc/dsv41-flash.env` (root only). It restarts after a crash, 
 failed starts in an hour. Not `docker --restart unless-stopped`: diffbot's `serve.sh` runs the container with `--rm`, and its warmup
 runs next to the container, so Docker alone would bring the server back cold.
 
+## Troubleshooting slow host-expert reads on Intel Linux
+
+If decode falls well below the reported rates, check GPU-kernel reads of mapped pinned host RAM on each card.
+The GPU-only expert path reads some weights from host RAM over PCIe. Normal link speed and width alone
+can miss a slowdown in these reads.
+
+On one bare-metal Intel Z890 host with a Core Ultra 9 285K, an RTX PRO 6000 Blackwell Max-Q and an
+RTX PRO 6000 Blackwell Workstation Edition, an off/on/off boot comparison reproduced the following
+512 MiB contiguous mapped-host-read rates in GB/s:
+
+| Intel IOMMU state | Max-Q | Workstation Edition |
+|---|---:|---:|
+| Disabled for one boot | 24.54–24.72 | 24.56–24.69 |
+| Enabled, both GPUs in `DMA-FQ` domains | 16.35–16.52 | 6.80–6.87 |
+| Disabled again | 24.53–24.66 | 24.54–24.67 |
+
+All three boots used Ubuntu kernel `6.8.0-149-generic`, NVIDIA driver `615.71.09`, and PCIe 5.0 ×8
+on both cards under load. Ranges cover two passes and three mapped host allocation methods. This is
+a host-specific result. `DMA-FQ` indicates a translated DMA domain with batched invalidation.
+[Linux IOMMU group documentation](https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-kernel-iommu_groups)
+
+1. Run `nvidia-smi --query-gpu=name,pci.bus_id --format=csv`. Using each GPU's PCI address, read
+   `/sys/bus/pci/devices/<BDF>/iommu_group/type`. Linux sysfs uses four domain digits, for example
+   `0000:02:00.0`.
+2. For a one-boot comparison on an Intel host using GRUB, highlight the Linux boot entry and press `e`.
+   Append `intel_iommu=off` to the kernel's `linux` line and boot with `Ctrl+x` or `F10`. Check `/proc/cmdline`
+   and the kernel log for `DMAR: IOMMU disabled`. Both GPU devices were still present and had no IOMMU
+   group on the test host. A normal reboot restores the saved GRUB entry.
+   [Linux kernel parameter reference](https://www.kernel.org/doc/html/v6.8/admin-guide/kernel-parameters.html)
+3. Repeat the same host-read probe or the same warmed `bench-fixed.py` workload, keeping the model,
+   recipe settings, and GPU placement fixed. The comparison here concerns GPU-to-host-RAM reads.
+   GPU-to-GPU peer-copy bandwidth stayed near 5.2 GB/s across the tested IOMMU states.
+
+Disabling the Intel IOMMU affects DMA isolation across the host and can prevent VFIO device passthrough.
+Keep the normal boot settings on hosts that depend on those features.
+
 ## How it works
 
 DeepSeek-V4.1 looks up 48 hashed rows per token in two ~384M-row Engram tables. diffbot pins them in host RAM and the GPU reads
